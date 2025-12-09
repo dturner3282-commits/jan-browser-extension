@@ -1,6 +1,6 @@
 {
   "name": "@janhq/mcp-web-client",
-  "version": "0.14.2",
+  "version": "0.14.3",
   "description": "TypeScript client library for websites to communicate with the Jan Browser MCP extension",
   "author": "Jan",
   "homepage": "https://github.com/janhq/jan-browser-extension",
