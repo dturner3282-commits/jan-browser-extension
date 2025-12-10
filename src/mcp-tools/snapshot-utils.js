@@ -1976,7 +1976,37 @@ export async function captureSnapshotForTab(tabId, fullPage = true, detailLevel 
   }
 }
 
-export async function captureSnapshotResponse({ tabId, status, details = [], fallbackUrl, fullPage = true, detailLevel = 'deep' }) {
+/**
+ * Capture a screenshot using the debugger
+ * @param {number} tabId - Tab ID to capture
+ * @returns {Promise<string|null>} Base64 encoded PNG data or null on failure
+ */
+async function captureScreenshotForTab(tabId) {
+  const target = { tabId };
+  try {
+    await attachDebugger(target);
+    try {
+      await sendDebuggerCommand(target, 'Page.enable', {});
+      const { data } = await sendDebuggerCommand(target, 'Page.captureScreenshot', { format: 'png', fromSurface: true });
+      if (!data) {
+        console.warn('[snapshot] Screenshot returned no data');
+        return null;
+      }
+      return data; // Return raw base64 data
+    } finally {
+      try {
+        await detachDebugger(target);
+      } catch (err) {
+        console.warn('[snapshot] Failed to detach debugger after screenshot:', err);
+      }
+    }
+  } catch (error) {
+    console.warn('[snapshot] Screenshot capture failed:', error);
+    return null;
+  }
+}
+
+export async function captureSnapshotResponse({ tabId, status, details = [], fallbackUrl, fullPage = true, detailLevel = 'deep', includeScreenshot = true }) {
   try {
     const snapshot = await captureSnapshotForTab(tabId, fullPage, detailLevel);
     if (!snapshot) {
@@ -1997,16 +2027,33 @@ export async function captureSnapshotResponse({ tabId, status, details = [], fal
     if (urls.length) meta.urls = urls;
     if (typeof tabId === 'number') meta.tabId = tabId;
 
+    const content = [
+      {
+        type: 'text',
+        text,
+      },
+    ];
+
+    // Capture screenshot if requested
+    let screenshotData = null;
+    if (includeScreenshot) {
+      screenshotData = await captureScreenshotForTab(tabId);
+      if (screenshotData) {
+        content.push({
+          type: 'image',
+          data: screenshotData,
+          mimeType: 'image/png',
+        });
+        console.log('[snapshot] Screenshot captured and included');
+      }
+    }
+
     return {
       ok: true,
-      content: [
-        {
-          type: 'text',
-          text,
-        },
-      ],
+      content,
       _meta: Object.keys(meta).length ? meta : undefined,
       snapshot,
+      screenshot: screenshotData, // Include screenshot data in result
     };
   } catch (error) {
     if (error?.ok === false && error.content) {
@@ -2042,6 +2089,11 @@ export function combineResultWithSnapshot(baseResult, snapshotResult, tabId) {
 
   if (snapshotResult.snapshot) {
     mergedData.snapshot = snapshotResult.snapshot;
+  }
+
+  // Include screenshot data if available
+  if (snapshotResult.screenshot) {
+    mergedData.screenshot = `data:image/png;base64,${snapshotResult.screenshot}`;
   }
 
   if (typeof tabId === 'number' && mergedData.tabId === undefined) {

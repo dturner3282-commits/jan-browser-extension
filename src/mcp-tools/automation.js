@@ -11,7 +11,7 @@ import {
   resolveAccessibilityRef,
   resolveBackendNodeToPoint,
 } from './action-targets.js';
-import { clickPointWithDebugger, typeTextWithDebugger, sendKeysWithDebugger, waitMs } from './debugger-input.js';
+import { clickPoint as performClick, typeText, sendKeys, waitMs } from './debugger-input.js';
 
 function formatElementLabel(detectedElement = {}, fallbackRef = '') {
   if (!detectedElement) {
@@ -274,7 +274,7 @@ export async function handleClickElement(params = {}) {
       await waitForLoadCompletion(tabId);
       await waitForDomIdle(tabId);
       // Small buffer to allow post-action DOM updates (e.g., animations/render)
-      await waitMs(200);
+      await waitMs(1000);
 
       const snapshotResult = await captureSnapshotResponse({
         tabId,
@@ -298,7 +298,7 @@ export async function handleClickElement(params = {}) {
       }
 
       try {
-        await clickPointWithDebugger(tabId, cssPoint);
+        await performClick(tabId, cssPoint);
       } catch (err) {
         console.error('[MCP Tools] debugger click failed', err);
         return createErrorResult('Click failed', err);
@@ -348,7 +348,7 @@ export async function handleClickElement(params = {}) {
       const located = await scrollOptionAndLocate(tabId, resolvedRef.parentRef, resolvedRef.childIndex);
       if (located?.success && located.clickPoint) {
         try {
-          await clickPointWithDebugger(tabId, located.clickPoint);
+          await performClick(tabId, located.clickPoint);
         } catch (err) {
           console.error('[MCP Tools] debugger click failed via indexed scroll', err);
           return createErrorResult('Click failed', err);
@@ -407,7 +407,7 @@ export async function handleClickElement(params = {}) {
           const clickPoint = await resolveBackendNodeToPoint(tabId, backendNodeId);
           if (clickPoint) {
             try {
-              await clickPointWithDebugger(tabId, clickPoint);
+              await performClick(tabId, clickPoint);
             } catch (err) {
               console.error('[MCP Tools] debugger click failed', err);
               return createErrorResult('Click failed', err);
@@ -450,7 +450,7 @@ export async function handleClickElement(params = {}) {
           const clickPoint = await resolveBackendNodeToPoint(tabId, backendNodeId);
           if (clickPoint) {
             try {
-              await clickPointWithDebugger(tabId, clickPoint);
+              await performClick(tabId, clickPoint);
             } catch (err) {
               console.error('[MCP Tools] debugger click failed', err);
               return createErrorResult('Click failed', err);
@@ -491,7 +491,7 @@ export async function handleClickElement(params = {}) {
         const cssLabel = formatElementLabel(cssTarget?.detectedElement, parsedTarget.label || ref);
         if (cssTarget?.success && cssTarget.clickPoint) {
           try {
-            await clickPointWithDebugger(tabId, cssTarget.clickPoint);
+            await performClick(tabId, cssTarget.clickPoint);
           } catch (err) {
             console.error('[MCP Tools] debugger click failed', err);
             return createErrorResult('Click failed', err);
@@ -531,7 +531,7 @@ export async function handleClickElement(params = {}) {
     }
 
     try {
-      await clickPointWithDebugger(tabId, preparedTarget.clickPoint);
+      await performClick(tabId, preparedTarget.clickPoint);
     } catch (err) {
       console.error('[MCP Tools] debugger click failed', err);
       return createErrorResult('Click failed', err);
@@ -742,7 +742,7 @@ export async function handleTypeText(params = {}) {
       await waitForLoadCompletion(tabId);
       await waitForDomIdle(tabId);
       // Allow UI updates triggered by typing to render before snapshot
-      await waitMs(200);
+      await waitMs(1000);
 
       const snapshotResult = await captureSnapshotResponse({
         tabId,
@@ -778,7 +778,7 @@ export async function handleTypeText(params = {}) {
       clickPoint = cssPoint;
 
       try {
-        await clickPointWithDebugger(tabId, cssPoint);
+        await performClick(tabId, cssPoint);
       } catch (err) {
         console.error('[MCP Tools] debugger click failed', err);
         return createErrorResult('Type text failed', err);
@@ -816,7 +816,7 @@ export async function handleTypeText(params = {}) {
             const backendPoint = await resolveBackendNodeToPoint(tabId, backendNodeId);
             if (backendPoint) {
               try {
-                await clickPointWithDebugger(tabId, backendPoint);
+                await performClick(tabId, backendPoint);
                 clickPoint = { x: backendPoint.x, y: backendPoint.y };
                 boundingRect = backendPoint.boundingRect || null;
                 resolvedRefValue = backendFallback;
@@ -833,7 +833,7 @@ export async function handleTypeText(params = {}) {
           const cssLabel = formatElementLabel(cssTarget?.detectedElement, parsedTarget.label || ref);
           if (cssTarget?.success && cssTarget.clickPoint) {
             try {
-              await clickPointWithDebugger(tabId, cssTarget.clickPoint);
+              await performClick(tabId, cssTarget.clickPoint);
               clickPoint = cssTarget.clickPoint;
               boundingRect = cssTarget.boundingRect || null;
               elementLabel = cssLabel;
@@ -853,7 +853,7 @@ export async function handleTypeText(params = {}) {
 
       try {
         if (!clickPoint) {
-          await clickPointWithDebugger(tabId, preparedTarget.clickPoint);
+          await performClick(tabId, preparedTarget.clickPoint);
           clickPoint = preparedTarget.clickPoint;
         }
       } catch (err) {
@@ -898,7 +898,7 @@ export async function handleTypeText(params = {}) {
     for (const segment of segments) {
       if (segment.type === 'text' && segment.value.length > 0) {
         const textSegment = segment.value;
-        const result = await typeTextWithDebugger(tabId, textSegment, { clear, pressEnter: false });
+        const result = await typeText(tabId, textSegment, { clear, pressEnter: false, point: clickPoint });
         clear = false; // Only clear once
         if (!result?.success) {
           return createErrorResult('Type text failed', result?.error || 'Typing failed');
@@ -906,7 +906,7 @@ export async function handleTypeText(params = {}) {
         typed = typed || { typedCharacters: 0 };
         typed.typedCharacters += textSegment.length;
       } else if (segment.type === 'keys' && segment.keys.length > 0) {
-        const result = await sendKeysWithDebugger(tabId, segment.keys);
+        const result = await sendKeys(tabId, segment.keys, { point: clickPoint });
         if (!result?.success) {
           return createErrorResult('Type text failed', result?.error || 'Key press failed');
         }
