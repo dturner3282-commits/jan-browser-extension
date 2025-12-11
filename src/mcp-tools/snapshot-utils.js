@@ -2,13 +2,29 @@
 // Shared helpers for building ARIA snapshot responses that match the MCP server
 
 import { selectTab } from '../lib/tab-manager.js';
+import { isCodeEditorElement, getCodeEditorMeta } from './code-mirror-utils.js';
 import { clearElementRefMap, getElementRefMap, setElementRefMap } from '../lib/element-ref-map.js';
 
 const DEBUGGER_PROTOCOL_VERSION = '1.3';
-const MAX_TREE_DEPTH = 8;
-const MAX_CHILDREN_PER_NODE = 16;
-const MAX_INTERACTIVE_ELEMENTS = 60;
-const MAX_LANDMARKS = 20;
+
+const SNAPSHOT_PRESETS = {
+  shallow: { domDepth: 8, axDepth: 8, maxChildren: 80, maxInteractive: 120, maxLandmarks: 40, maxPerFrame: 100 },
+  medium: { domDepth: 16, axDepth: 16, maxChildren: 160, maxInteractive: 300, maxLandmarks: 120, maxPerFrame: 200 },
+  deep: { domDepth: 64, axDepth: 64, maxChildren: 240, maxInteractive: 800, maxLandmarks: 240, maxPerFrame: 300 },
+  all: {
+    domDepth: Number.POSITIVE_INFINITY,
+    axDepth: Number.POSITIVE_INFINITY,
+    maxChildren: Number.POSITIVE_INFINITY,
+    maxInteractive: Number.POSITIVE_INFINITY,
+    maxLandmarks: Number.POSITIVE_INFINITY,
+    maxPerFrame: Number.POSITIVE_INFINITY,
+  },
+};
+
+function getSnapshotLimits(detailLevel = 'medium') {
+  const key = typeof detailLevel === 'string' ? detailLevel.toLowerCase() : 'medium';
+  return SNAPSHOT_PRESETS[key] || SNAPSHOT_PRESETS.medium;
+}
 
 const INTERACTIVE_ROLE_KEYS = new Set(
   [
@@ -61,10 +77,26 @@ const LANDMARK_ROLE_KEYS = new Set(
 let currentAxRefMap = new Map();
 let currentAxRefCounter = 2;
 let currentSnapshotPrefix = 's1';
+let currentFrameOrdinal = 0; // Track current frame being processed
 const snapshotCache = new Map();
 const snapshotIdsByTab = new Map();
 const snapshotSequenceByTab = new Map();
 let navigationListenersRegistered = false;
+let snapshotLimits = SNAPSHOT_PRESETS.deep;
+
+function setSnapshotLimits(level = 'medium') {
+  if (typeof level === 'string') {
+    snapshotLimits = getSnapshotLimits(level);
+  } else if (level && typeof level === 'object') {
+    snapshotLimits = level;
+  } else {
+    snapshotLimits = SNAPSHOT_PRESETS.medium;
+  }
+}
+
+function getCurrentLimits() {
+  return snapshotLimits || SNAPSHOT_PRESETS.medium;
+}
 
 function ensureNavigationCacheResets() {
   if (navigationListenersRegistered) return;
@@ -88,6 +120,7 @@ ensureNavigationCacheResets();
 function resetAccessibleRefMap() {
   currentAxRefMap = new Map();
   currentAxRefCounter = 2;
+  currentFrameOrdinal = 0;
 }
 
 export function clearSnapshotsForTab(tabId) {
@@ -240,10 +273,61 @@ function buildSnapshotText(snapshot, status, details = []) {
   );
 }
 
-async function captureDomSnapshot(tabId, fullPage = true) {
+async function captureDomSnapshot(tabId, fullPage = true, limits = null) {
+  const snapshotLimits = limits || getSnapshotLimits('deep');
   const [{ result }] = await chrome.scripting.executeScript({
     target: { tabId },
-    func: (fullPage) => {
+    func: (fullPage, limits) => {
+      // Helper function to get snapshot limits (passed as argument)
+      const getCurrentLimits = () => limits;
+
+      // CodeMirror detection helpers (must be defined inside injected script)
+      const isCodeEditorElement = (element) => {
+        if (!element) return false;
+        const className = typeof element.className === 'string' ? element.className : '';
+        if (className && /(codemirror|cm-editor|cm-content)/i.test(className)) {
+          return true;
+        }
+        try {
+          return Boolean(element.closest?.('.CodeMirror, .cm-editor, [data-codemirror]'));
+        } catch (_) {
+          return false;
+        }
+      };
+
+      const getCodeEditorMeta = (element) => {
+        if (!isCodeEditorElement(element)) return null;
+
+        let root = element;
+        try {
+          root = element.closest?.('.CodeMirror, .cm-editor, [data-codemirror]') || element;
+        } catch (_) {
+          // ignore
+        }
+
+        const textarea = root?.querySelector?.(
+          'textarea[aria-label], textarea[placeholder], textarea[name], textarea[id]',
+        );
+
+        const label =
+          root?.getAttribute?.('aria-label') ||
+          root?.getAttribute?.('data-placeholder') ||
+          root?.getAttribute?.('placeholder') ||
+          textarea?.getAttribute?.('aria-label') ||
+          textarea?.getAttribute?.('placeholder') ||
+          textarea?.name ||
+          textarea?.id ||
+          '';
+
+        const content =
+          root?.querySelector?.('.cm-content') ||
+          root?.querySelector?.('.CodeMirror-code') ||
+          root?.querySelector?.('[contenteditable="true"]');
+        const text = (content?.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 240);
+
+        return { label, text };
+      };
+
       const buildElementRef = (element, shadowPath = []) => {
         if (!element || element.nodeType !== Node.ELEMENT_NODE) return null;
 
@@ -332,9 +416,14 @@ async function captureDomSnapshot(tabId, fullPage = true) {
         const explicitRole = element.getAttribute('role');
         if (explicitRole) return explicitRole;
 
+        if (isCodeEditorElement(element)) return 'textbox';
+
         const tag = element.tagName;
         if (tag === 'A') return 'link';
         if (tag === 'BUTTON') return 'button';
+        if (tag === 'SELECT') return 'listbox';
+        if (tag === 'OPTION') return 'option';
+        if (tag === 'LI') return 'listitem';
         if (tag === 'INPUT') {
           if (element.type === 'checkbox') return 'checkbox';
           if (element.type === 'radio') return 'radio';
@@ -354,10 +443,12 @@ async function captureDomSnapshot(tabId, fullPage = true) {
         return null;
       };
 
-      const buildAriaTree = (element, depth = 0, maxDepth = MAX_TREE_DEPTH, inShadow = false) => {
+      const buildAriaTree = (element, depth = 0, maxDepth = getCurrentLimits().domDepth, inShadow = false) => {
         if (!element || depth > maxDepth) return null;
 
         const role = inferRole(element);
+        const codeMeta = getCodeEditorMeta(element);
+        const isCodeEditor = Boolean(codeMeta);
         if (!role) {
           const children = [];
 
@@ -384,13 +475,23 @@ async function captureDomSnapshot(tabId, fullPage = true) {
               role: 'group',
               name: '',
               tag: element.tagName.toLowerCase(),
-              children: children.slice(0, MAX_CHILDREN_PER_NODE),
+              children: children.slice(0, getCurrentLimits().maxChildren),
             };
           }
           return null;
         }
 
         const textContent = element.textContent?.trim() || '';
+        const codeLabel = codeMeta?.label || '';
+        const codeValue = (() => {
+          if (!isCodeEditor) return '';
+          const metaText = (codeMeta?.text || '').trim();
+          if (metaText) return metaText;
+          const inner = typeof element.innerText === 'string' ? element.innerText.trim().replace(/\s+/g, ' ') : '';
+          if (inner) return inner;
+          const text = typeof element.textContent === 'string' ? element.textContent.trim().replace(/\s+/g, ' ') : '';
+          return text;
+        })();
         const ariaLabel =
           element.getAttribute('aria-label') ||
           element.getAttribute('aria-labelledby') ||
@@ -399,7 +500,13 @@ async function captureDomSnapshot(tabId, fullPage = true) {
 
         const node = {
           role,
-          name: ariaLabel || textContent.slice(0, 50) || '',
+          name:
+            (codeValue ? codeValue.slice(0, 120) : '') ||
+            ariaLabel ||
+            codeLabel ||
+            textContent.slice(0, 50) ||
+            (isCodeEditor ? 'Code editor' : '') ||
+            '',
           tag: element.tagName.toLowerCase(),
         };
 
@@ -419,6 +526,19 @@ async function captureDomSnapshot(tabId, fullPage = true) {
         if (attr('aria-disabled')) node.disabled = attr('aria-disabled') === 'true';
         if (attr('aria-level')) node.level = Number.parseInt(attr('aria-level'), 10);
         if (attr('aria-current')) node.current = attr('aria-current');
+        const textValue = codeValue || (isCodeEditor ? textContent : '');
+        if (textValue) {
+          node.value = textValue;
+          node.text = textValue;
+          node.description = textValue;
+        } else if (isCodeEditor && !node.value) {
+          const fallback = textContent || codeLabel;
+          if (fallback) {
+            node.value = fallback;
+            node.text = fallback;
+            node.description = fallback;
+          }
+        }
 
         if (element.id) node.id = element.id;
         if (element.className && typeof element.className === 'string') {
@@ -448,7 +568,7 @@ async function captureDomSnapshot(tabId, fullPage = true) {
           }
         }
 
-        if (children.length) node.children = children.slice(0, MAX_CHILDREN_PER_NODE);
+        if (children.length) node.children = children.slice(0, getCurrentLimits().maxChildren);
 
         return node;
       };
@@ -488,6 +608,52 @@ async function captureDomSnapshot(tabId, fullPage = true) {
               ariaSelected: el.getAttribute('aria-selected') || undefined,
               ref: buildElementRef(el) || undefined,
             };
+
+            if (inShadow) {
+              item.inShadowDOM = true;
+            }
+
+            results.push(item);
+          }
+
+          // Explicitly surface CodeMirror editors that may not match default selectors
+          const codeEditors = Array.from(root.querySelectorAll('.CodeMirror, .cm-editor, .cm-content, [data-codemirror]'));
+          for (const editor of codeEditors) {
+            const target =
+              editor.querySelector?.('.cm-content[contenteditable], .cm-content, .CodeMirror-code, textarea, [contenteditable="true"]') ||
+              editor;
+            if (!target || visited.has(target)) continue;
+            visited.add(target);
+            if (!shouldIncludeElement(target)) continue;
+            if (results.length >= 50) return;
+
+            const meta = getCodeEditorMeta(target);
+            const valuePreview =
+              (meta?.text && meta.text.trim()) ||
+              (typeof target.innerText === 'string' ? target.innerText.trim().replace(/\s+/g, ' ') : '') ||
+              (typeof target.textContent === 'string' ? target.textContent.trim().replace(/\s+/g, ' ') : '') ||
+              '';
+            const label =
+              (valuePreview ? valuePreview.slice(0, 120) : '') ||
+              meta?.label ||
+              target.getAttribute?.('aria-label') ||
+              target.getAttribute?.('placeholder') ||
+              'Code editor';
+
+            const item = {
+              index: results.length,
+              role: 'textbox',
+              tag: target.tagName?.toLowerCase() || 'div',
+              label,
+              id: target.id || undefined,
+              name: target.name || undefined,
+              ref: buildElementRef(target) || undefined,
+              className: typeof target.className === 'string' ? target.className : undefined,
+            };
+
+            if (valuePreview) {
+              item.value = valuePreview;
+            }
 
             if (inShadow) {
               item.inShadowDOM = true;
@@ -619,7 +785,7 @@ async function captureDomSnapshot(tabId, fullPage = true) {
 
       return snapshot;
     },
-    args: [fullPage],
+    args: [fullPage, snapshotLimits],
   });
 
   return result || null;
@@ -762,16 +928,19 @@ function compactObject(source = {}) {
   return result;
 }
 
-function formatAccessibleRef(nodeId) {
+function formatAccessibleRef(nodeId, frameOrdinal = null) {
   if (nodeId === undefined || nodeId === null) {
     return undefined;
   }
 
   if (!currentAxRefMap.has(nodeId)) {
-    // Always use counter for stable refs across page reloads
-    // s1e0, s1e1, s1e2, etc. - s1 = snapshot 1, e{counter} = element counter
-    // This ensures the same element gets the same ref after page reload
-    const refId = `${currentSnapshotPrefix}e${currentAxRefCounter}`;
+    // Generate ref with frame ordinal for iframe elements
+    // Main frame (f0): s1e1, s1e2, etc.
+    // Iframe 1 (f1): s1f1e1, s1f1e2, etc.
+    // Iframe 2 (f2): s1f2e1, s1f2e2, etc.
+    const frame = frameOrdinal !== null ? frameOrdinal : currentFrameOrdinal;
+    const framePart = frame > 0 ? `f${frame}` : '';
+    const refId = `${currentSnapshotPrefix}${framePart}e${currentAxRefCounter}`;
     currentAxRefMap.set(nodeId, refId);
     currentAxRefCounter += 1;
   }
@@ -798,10 +967,15 @@ function normalizeAxRole(role) {
 
 function shouldFlattenAxNode(node) {
   if (!node) return true;
-  if (node.ignored) return true;
+  const properties = axEntriesToObject(node.properties);
+  const state = axEntriesToObject(node.state);
+  const focusable = properties.focusable === true || properties.focusable === 'true' || state.focused === true;
+  const actionable = properties.clickable === true || (Array.isArray(node.actions) && node.actions.length > 0);
+
+  if (node.ignored && !focusable && !actionable) return true;
 
   const roleKey = getRoleKey(node);
-  if (!roleKey) return true;
+  if (!roleKey && !focusable && !actionable) return true;
 
   if (
     roleKey === 'presentation' ||
@@ -817,6 +991,7 @@ function shouldFlattenAxNode(node) {
     const hasName = node.name?.value && node.name.value.trim().length > 0;
     const hasActions = Array.isArray(node.actions) && node.actions.length > 0;
     const hasValue = node.value?.value !== undefined && node.value.value !== '';
+    if (focusable || actionable) return false;
     if (hasActions || hasValue) return false;
     if (!hasName) return true;
     return false;
@@ -825,6 +1000,7 @@ function shouldFlattenAxNode(node) {
   if (roleKey === 'group') {
     const hasActions = Array.isArray(node.actions) && node.actions.length > 0;
     const hasName = node.name?.value && node.name.value.trim().length > 0;
+    if (focusable || actionable) return false;
     if (!hasActions && !hasName) return true;
     return false;
   }
@@ -833,7 +1009,7 @@ function shouldFlattenAxNode(node) {
 }
 
 function serializeAxNode(node, map, depth = 0) {
-  if (!node || depth > MAX_TREE_DEPTH) return [];
+  if (!node || depth > getCurrentLimits().axDepth) return [];
 
   const includeNode = !shouldFlattenAxNode(node);
   const nextDepth = includeNode ? depth + 1 : depth;
@@ -843,6 +1019,40 @@ function serializeAxNode(node, map, depth = 0) {
   const name = getImprovedAccessibleName(node);
   const description = getAccessibleDescription(node);
   const value = axValueToPrimitive(node?.value);
+  const rawProperties = axEntriesToObject(node.properties);
+  const rawState = axEntriesToObject(node.state);
+
+  let effectiveName = name;
+  let effectiveValue = value;
+
+  // For CodeMirror-like textboxes with poor names, fall back to value/placeholder/description
+  if ((role === 'textbox' || role === 'searchbox' || role === 'combobox' || role === 'generic') && (!effectiveName || isUnhelpfulLabel(effectiveName, role))) {
+    const placeholder = rawProperties?.placeholder || rawProperties?.['aria-placeholder'] || rawProperties?.title;
+    const valueFromProps = rawProperties?.value || rawProperties?.text || rawProperties?.label;
+    const candidate = description || placeholder || valueFromProps || value;
+    if (candidate && typeof candidate === 'string' && candidate.trim()) {
+      effectiveName = candidate;
+    } else if (value && typeof value === 'string' && value.trim()) {
+      effectiveName = value;
+    }
+  }
+
+  if (!effectiveValue && typeof rawProperties?.value === 'string' && rawProperties.value.trim()) {
+    effectiveValue = rawProperties.value;
+  }
+
+  // If we have real text in the value, prefer it as the name for text inputs/editors
+  if (
+    effectiveValue &&
+    typeof effectiveValue === 'string' &&
+    (role === 'textbox' || role === 'searchbox' || role === 'combobox' || role === 'generic')
+  ) {
+    effectiveName = effectiveValue;
+  }
+
+  if (!effectiveName && (role === 'textbox' || role === 'generic')) {
+    effectiveName = 'Code editor';
+  }
 
   let serialized = null;
 
@@ -852,20 +1062,25 @@ function serializeAxNode(node, map, depth = 0) {
       ref: formatAccessibleRef(node.nodeId),
       axNodeId: node.nodeId,
       role,
-      name,
-      description,
-      value,
+      name: effectiveName,
+      description: description || effectiveValue,
+      value: effectiveValue,
     });
 
     if (Array.isArray(node.actions) && node.actions.length) {
       serialized.actions = node.actions.slice(0, 6);
     }
 
-    const properties = compactObject(axEntriesToObject(node.properties));
-    const state = compactObject(axEntriesToObject(node.state));
+    const properties = compactObject(rawProperties);
+    const state = compactObject(rawState);
 
     if (Object.keys(properties).length) serialized.properties = properties;
     if (Object.keys(state).length) serialized.state = state;
+
+    // Ensure text surfaces in snapshot output for editors
+    if (effectiveValue && !serialized.text) {
+      serialized.text = effectiveValue;
+    }
 
     if (node.backendDOMNodeId) serialized.backendNodeId = node.backendDOMNodeId;
     if (node.domNodeId) serialized.domNodeId = node.domNodeId;
@@ -879,10 +1094,10 @@ function serializeAxNode(node, map, depth = 0) {
       if (serializedChildren.length) {
         for (const entry of serializedChildren) {
           children.push(entry);
-          if (children.length >= MAX_CHILDREN_PER_NODE) break;
+          if (children.length >= getCurrentLimits().maxChildren) break;
         }
       }
-      if (children.length >= MAX_CHILDREN_PER_NODE) break;
+      if (children.length >= getCurrentLimits().maxChildren) break;
     }
   }
 
@@ -897,10 +1112,11 @@ function serializeAxNode(node, map, depth = 0) {
   return [serialized];
 }
 
-function extractInteractiveFromAxNodes(nodes) {
+function extractInteractiveFromAxNodes(nodes, limit) {
   if (!Array.isArray(nodes) || !nodes.length) return [];
 
   const results = [];
+  const maxLimit = limit !== undefined ? limit : getCurrentLimits().maxInteractive;
 
   for (const node of nodes) {
     if (!node || node.ignored) continue;
@@ -956,16 +1172,17 @@ function extractInteractiveFromAxNodes(nodes) {
 
     results.push(entry);
 
-    if (results.length >= MAX_INTERACTIVE_ELEMENTS) break;
+    if (results.length >= maxLimit) break;
   }
 
   return results.map((entry, index) => ({ ...entry, index }));
 }
 
-function extractLandmarksFromAxNodes(nodes) {
+function extractLandmarksFromAxNodes(nodes, limit) {
   if (!Array.isArray(nodes) || !nodes.length) return [];
 
   const results = [];
+  const maxLimit = limit !== undefined ? limit : getCurrentLimits().maxLandmarks;
 
   for (const node of nodes) {
     if (!node || node.ignored) continue;
@@ -988,14 +1205,16 @@ function extractLandmarksFromAxNodes(nodes) {
       }),
     );
 
-    if (results.length >= MAX_LANDMARKS) break;
+    if (results.length >= maxLimit) break;
   }
 
   return results;
 }
 
-function extractHeadingsFromAxNodes(nodes) {
+function extractHeadingsFromAxNodes(nodes, limit) {
   if (!Array.isArray(nodes) || !nodes.length) return [];
+
+  const maxLimit = limit !== undefined ? limit : 9999; // No global limit for headings, only per-frame
 
   const results = [];
 
@@ -1020,7 +1239,7 @@ function extractHeadingsFromAxNodes(nodes) {
       }),
     );
 
-    if (results.length >= 30) break;
+    if (results.length >= maxLimit) break;
   }
 
   return results;
@@ -1151,18 +1370,45 @@ export function sendDebuggerCommand(target, method, params) {
 /**
  * Build a mapping from accessibility refs to CSS selectors using backendNodeId
  * This must be called AFTER serializeAxNode so that currentAxRefMap is populated
- * @param {Array} nodes - Accessibility tree nodes
+ * @param {Array} nodes - Accessibility tree nodes from all frames
  * @param {Object} target - Debugger target { tabId }
+ * @param {Array} frameResults - Array of frame data with frameId info
  * @returns {Promise<Object>} Map of ref IDs to CSS selectors
  */
-async function buildRefToSelectorMap(nodes, target) {
+async function buildRefToSelectorMap(nodes, target, frameResults = []) {
   const refMap = {};
   const startTime = performance.now();
 
-  console.log(`[RefMap] Building mapping for ${nodes.length} total accessibility nodes`);
+  console.log(`[RefMap] Building mapping for ${nodes.length} total accessibility nodes across ${frameResults.length || 1} frames`);
 
-  // Pre-filter nodes to only those with refs and backendNodeIds
+  // Map child index and parent ref for each node for better targeting (e.g., virtualized lists)
+  const childIndexByNodeId = new Map();
+  const parentRefByNodeId = new Map();
+  for (const node of nodes) {
+    if (Array.isArray(node.childIds)) {
+      node.childIds.forEach((childId, idx) => {
+        childIndexByNodeId.set(childId, idx);
+        parentRefByNodeId.set(childId, currentAxRefMap.get(node.nodeId) || null);
+      });
+    }
+  }
+
+  // Create a map of node to frameId for iframe nodes
+  const nodeToFrameId = new Map();
+  if (frameResults.length > 0) {
+    for (const frameData of frameResults) {
+      if (frameData.nodes && frameData.frameId) {
+        for (const node of frameData.nodes) {
+          nodeToFrameId.set(node.nodeId, frameData.frameId);
+        }
+      }
+    }
+  }
+
+  // Pre-filter nodes to only those with refs
   const nodesToMap = [];
+  const nodesWithoutBackendId = [];
+
   for (const node of nodes) {
     if (node.ignored) continue;
 
@@ -1170,35 +1416,54 @@ async function buildRefToSelectorMap(nodes, target) {
     if (!refId) continue;
 
     const backendNodeId = node.backendDOMNodeId || node.domNodeId;
-    if (!backendNodeId) continue;
+    const frameId = nodeToFrameId.get(node.nodeId);
+    const childIndex = childIndexByNodeId.get(node.nodeId);
+    const parentRef = parentRefByNodeId.get(node.nodeId) || null;
 
-    nodesToMap.push({ node, refId, backendNodeId });
-
-    if (nodesToMap.length >= 500) break; // Limit for performance
+    if (backendNodeId) {
+      nodesToMap.push({ node, refId, backendNodeId, frameId, childIndex, parentRef });
+    } else {
+      // Store ref even without backendNodeId - it won't have CSS selector but can still be referenced
+      nodesWithoutBackendId.push({ refId, frameId, childIndex, parentRef });
+    }
   }
 
-  console.log(`[RefMap] Processing ${nodesToMap.length} nodes with refs`);
+  console.log(`[RefMap] Processing ${nodesToMap.length} nodes with backend IDs, ${nodesWithoutBackendId.length} without`);
 
   // Batch parallel requests with concurrency control
   const BATCH_SIZE = 50;
   let cssCount = 0;
   let backendCount = 0;
 
+  if (nodesToMap.length > 1000) {
+    console.warn(`[RefMap] Large ref map (${nodesToMap.length} nodes) – mapping all refs; may take a moment`);
+  }
+
   for (let i = 0; i < nodesToMap.length; i += BATCH_SIZE) {
     const batch = nodesToMap.slice(i, i + BATCH_SIZE);
 
     const descriptions = await Promise.allSettled(
-      batch.map(({ backendNodeId }) =>
-        sendDebuggerCommand(target, 'DOM.describeNode', { backendNodeId })
-      )
+      batch.map(({ backendNodeId, frameId }) => {
+        const params = { backendNodeId };
+        // Add frameId for iframe nodes to ensure correct context
+        if (frameId) {
+          params.frameId = frameId;
+        }
+        return sendDebuggerCommand(target, 'DOM.describeNode', params);
+      })
     );
 
     // Process results
     descriptions.forEach((result, idx) => {
-      const { refId, backendNodeId } = batch[idx];
+      const { refId, backendNodeId, frameId, childIndex, parentRef } = batch[idx];
 
       if (result.status === 'rejected' || !result.value?.node) {
-        refMap[refId] = `backend:${backendNodeId}`;
+        refMap[refId] = { backend: backendNodeId };
+        if (frameId) {
+          refMap[refId].frameId = frameId;
+        }
+        if (parentRef) refMap[refId].parentRef = parentRef;
+        if (childIndex !== undefined) refMap[refId].childIndex = childIndex;
         backendCount++;
         return;
       }
@@ -1207,17 +1472,38 @@ async function buildRefToSelectorMap(nodes, target) {
       const selector = buildCssSelector(domNode);
 
       if (selector) {
-        refMap[refId] = `css:${selector}`;
+        refMap[refId] = { css: `css:${selector}`, backend: backendNodeId };
+        if (frameId) {
+          refMap[refId].frameId = frameId;
+        }
+        if (parentRef) refMap[refId].parentRef = parentRef;
+        if (childIndex !== undefined) refMap[refId].childIndex = childIndex;
         cssCount++;
       } else {
-        refMap[refId] = `backend:${backendNodeId}`;
+        refMap[refId] = { backend: backendNodeId };
+        if (frameId) {
+          refMap[refId].frameId = frameId;
+        }
+        if (parentRef) refMap[refId].parentRef = parentRef;
+        if (childIndex !== undefined) refMap[refId].childIndex = childIndex;
         backendCount++;
       }
     });
   }
 
+  // Add refs without backend IDs (won't have selectors, but still referenceable)
+  for (const { refId, frameId, childIndex, parentRef } of nodesWithoutBackendId) {
+    refMap[refId] = { placeholder: true }; // Mark as placeholder - no selector available
+    if (frameId) {
+      refMap[refId].frameId = frameId;
+    }
+    if (parentRef) refMap[refId].parentRef = parentRef;
+    if (childIndex !== undefined) refMap[refId].childIndex = childIndex;
+  }
+
+  const totalRefs = cssCount + backendCount + nodesWithoutBackendId.length;
   const elapsed = Math.round(performance.now() - startTime);
-  console.log(`[RefMap] Mapped ${cssCount + backendCount} refs in ${elapsed}ms (${cssCount} CSS, ${backendCount} backend)`);
+  console.log(`[RefMap] Mapped ${totalRefs} refs in ${elapsed}ms (${cssCount} CSS, ${backendCount} backend, ${nodesWithoutBackendId.length} placeholder)`);
 
   if (backendCount > cssCount) {
     console.warn(`[RefMap] Warning: More backend refs than CSS refs - visual overlay limited`);
@@ -1260,6 +1546,146 @@ function parseAttributes(attrArray) {
   return attrs;
 }
 
+/**
+ * Merge iframe content into the main tree by finding iframe nodes and injecting their content
+ * @param {Object} tree - Main frame tree
+ * @param {Map} frameTreeMap - Map of frameId -> iframe tree
+ * @param {Map} backendNodeToFrameId - Map of backendNodeId -> frameId for iframe elements
+ * @returns {Object} Merged tree with iframe content as children of iframe nodes
+ */
+function mergeIframeContent(tree, frameTreeMap, backendNodeToFrameId) {
+  if (!tree) return tree;
+
+  // Clone the tree to avoid mutating the original
+  const merged = { ...tree };
+
+  // If this is an iframe node, try to inject its content
+  if (merged.role === 'iframe' || merged.role === 'Iframe') {
+    // Look up frameId using backendNodeId
+    const backendId = merged.backendNodeId;
+    const frameId = backendId ? backendNodeToFrameId.get(backendId) : null;
+
+    if (frameId && frameTreeMap.has(frameId)) {
+      const iframeTree = frameTreeMap.get(frameId);
+      console.log(`[snapshot] Merging iframe content for frameId: ${frameId} (backendNodeId: ${backendId})`);
+
+      // Add iframe content as children
+      if (iframeTree) {
+        merged.children = merged.children || [];
+        // Inject the iframe's tree as children
+        if (Array.isArray(iframeTree.children)) {
+          merged.children.push(...iframeTree.children);
+        } else {
+          merged.children.push(iframeTree);
+        }
+      }
+    }
+  }
+
+  // Recursively process children
+  if (Array.isArray(merged.children)) {
+    merged.children = merged.children.map(child =>
+      mergeIframeContent(child, frameTreeMap, backendNodeToFrameId)
+    );
+  }
+
+  return merged;
+}
+
+/**
+ * Recursively collect all frames from frame tree in depth-first order
+ * @param {Object} frameTree - Frame tree from Page.getFrameTree
+ * @param {Array} frames - Accumulated array of frames
+ * @returns {Array} Array of frame objects with ordinal
+ */
+function collectFrames(frameTree, frames = []) {
+  if (!frameTree?.frame) return frames;
+
+  // Add current frame with ordinal
+  const frameOrdinal = frames.length;
+  frames.push({
+    frameId: frameTree.frame.id,
+    ordinal: frameOrdinal,
+    url: frameTree.frame.url,
+    name: frameTree.frame.name,
+    securityOrigin: frameTree.frame.securityOrigin,
+  });
+
+  // Recursively process child frames (depth-first)
+  if (Array.isArray(frameTree.childFrames)) {
+    for (const childFrame of frameTree.childFrames) {
+      collectFrames(childFrame, frames);
+    }
+  }
+
+  return frames;
+}
+
+/**
+ * Capture accessibility tree for a specific frame
+ * @param {Object} target - Debugger target { tabId }
+ * @param {String} frameId - Frame ID to capture (null for main frame)
+ * @param {Number} frameOrdinal - Frame ordinal for ref generation
+ * @returns {Object} Frame accessibility data
+ */
+async function captureFrameAccessibilityTree(target, frameId, frameOrdinal) {
+  try {
+    // Set current frame ordinal for ref generation
+    currentFrameOrdinal = frameOrdinal;
+
+    const params = {
+      maxDepth: getCurrentLimits().axDepth + 2,
+      fetchRelatives: true,
+    };
+
+    // Add frameId if capturing iframe (null/undefined for main frame)
+    if (frameId) {
+      params.frameId = frameId;
+    }
+
+    const response = await sendDebuggerCommand(target, 'Accessibility.getFullAXTree', params);
+
+    const nodes = Array.isArray(response?.nodes) ? response.nodes : [];
+    if (!nodes.length) {
+      console.log(`[snapshot] Frame ${frameOrdinal} (${frameId || 'main'}) returned no accessibility nodes`);
+      return null;
+    }
+
+    console.log(`[snapshot] Frame ${frameOrdinal} (${frameId || 'main'}) captured ${nodes.length} accessibility nodes`);
+
+    const nodeMap = new Map(nodes.map((node) => [node.nodeId, node]));
+
+    const root =
+      nodes.find((node) => !node.ignored && ['rootwebarea', 'webarea'].includes(getRoleKey(node))) ||
+      nodes.find((node) => !node.ignored) ||
+      nodes[0];
+
+    const serializedTree = serializeAxNode(root, nodeMap, 0);
+    const tree = Array.isArray(serializedTree)
+      ? serializedTree[0] || null
+      : serializedTree || null;
+
+    // Apply per-frame limits for iframes (main frame uses global limits)
+    const perFrameLimit = frameOrdinal > 0 ? getCurrentLimits().maxPerFrame : undefined;
+    const interactive = extractInteractiveFromAxNodes(nodes, perFrameLimit);
+    const landmarks = extractLandmarksFromAxNodes(nodes, perFrameLimit);
+    const headings = extractHeadingsFromAxNodes(nodes, perFrameLimit);
+
+    return {
+      frameOrdinal,
+      frameId: frameId || null,
+      tree,
+      nodes, // Keep nodes for ref map building
+      interactive,
+      landmarks,
+      headings,
+    };
+  } catch (error) {
+    console.warn(`[snapshot] Frame ${frameOrdinal} (${frameId || 'main'}) accessibility capture failed:`, error);
+    return null;
+  }
+}
+
 async function captureAccessibilityTree(tabId) {
   if (!chrome?.debugger?.attach) {
     return null;
@@ -1279,41 +1705,177 @@ async function captureAccessibilityTree(tabId) {
   try {
     await sendDebuggerCommand(target, 'Accessibility.enable');
     await sendDebuggerCommand(target, 'DOM.enable');
-
-    const response = await sendDebuggerCommand(target, 'Accessibility.getFullAXTree', {
-      maxDepth: MAX_TREE_DEPTH + 2,
-      fetchRelatives: true,
+    await sendDebuggerCommand(target, 'Page.enable');
+    await sendDebuggerCommand(target, 'Target.setAutoAttach', {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true, // Get all targets in flat list including OOPIFs
     });
 
-    const nodes = Array.isArray(response?.nodes) ? response.nodes : [];
-    if (!nodes.length) {
+    // Get frame tree to discover all iframes (including OOPIFs)
+    let frames = [];
+    try {
+      const frameTreeResponse = await sendDebuggerCommand(target, 'Page.getFrameTree');
+      if (frameTreeResponse?.frameTree) {
+        frames = collectFrames(frameTreeResponse.frameTree);
+        console.log(`[snapshot] Discovered ${frames.length} frames from frame tree`);
+      }
+    } catch (error) {
+      console.warn('[snapshot] Page.getFrameTree failed, falling back to main frame only:', error);
+      frames = [{ frameId: null, ordinal: 0, url: null, name: null }];
+    }
+
+    // Also try to get all frames using DOM.getDocument with pierce for OOPIFs
+    try {
+      const docResponse = await sendDebuggerCommand(target, 'DOM.getDocument', {
+        depth: -1,
+        pierce: true  // Traverse into iframes and shadow roots
+      });
+
+      if (docResponse?.root) {
+        // Recursively collect all iframe frameIds from the document tree
+        const iframeFrameIds = new Set();
+        const collectIframeFrameIds = (node) => {
+          if (node.nodeName?.toLowerCase() === 'iframe' && node.frameId) {
+            iframeFrameIds.add(node.frameId);
+            console.log(`[snapshot] Found iframe with frameId: ${node.frameId}, contentDocument: ${!!node.contentDocument}`);
+          }
+          // Also check contentDocument which is the iframe's document
+          if (node.contentDocument) {
+            if (node.contentDocument.frameId) {
+              iframeFrameIds.add(node.contentDocument.frameId);
+            }
+            collectIframeFrameIds(node.contentDocument);
+          }
+          if (node.children) {
+            for (const child of node.children) {
+              collectIframeFrameIds(child);
+            }
+          }
+        };
+
+        collectIframeFrameIds(docResponse.root);
+        console.log(`[snapshot] Found ${iframeFrameIds.size} iframe frameIds via DOM.getDocument`);
+
+        // Add any missing frames from DOM traversal
+        for (const frameId of iframeFrameIds) {
+          if (!frames.some(f => f.frameId === frameId)) {
+            frames.push({
+              frameId: frameId,
+              ordinal: frames.length,
+              url: null,
+              name: null,
+              securityOrigin: null,
+            });
+          }
+        }
+
+        console.log(`[snapshot] Total frames after DOM scan: ${frames.length}`);
+      }
+    } catch (error) {
+      console.warn('[snapshot] DOM.getDocument with pierce failed:', error);
+    }
+
+    // Capture accessibility tree for each frame
+    const frameResults = [];
+    for (const frame of frames) {
+      const frameData = await captureFrameAccessibilityTree(target, frame.frameId, frame.ordinal);
+      if (frameData) {
+        frameData.url = frame.url;
+        frameData.name = frame.name;
+        frameResults.push(frameData);
+      }
+    }
+
+    if (frameResults.length === 0) {
+      console.warn('[snapshot] No frame data captured');
       return null;
     }
 
-    const nodeMap = new Map(nodes.map((node) => [node.nodeId, node]));
+    // Merge data from all frames
+    const mainFrame = frameResults[0];
+    const allNodes = [];
+    const allInteractive = [];
+    const allLandmarks = [];
+    const allHeadings = [];
 
-    const root =
-      nodes.find((node) => !node.ignored && ['rootwebarea', 'webarea'].includes(getRoleKey(node))) ||
-      nodes.find((node) => !node.ignored) ||
-      nodes[0];
+    for (const frameData of frameResults) {
+      if (frameData.nodes) {
+        allNodes.push(...frameData.nodes);
+      }
+      if (Array.isArray(frameData.interactive)) {
+        allInteractive.push(...frameData.interactive);
+      }
+      if (Array.isArray(frameData.landmarks)) {
+        allLandmarks.push(...frameData.landmarks);
+      }
+      if (Array.isArray(frameData.headings)) {
+        allHeadings.push(...frameData.headings);
+      }
+    }
 
-    const serializedTree = serializeAxNode(root, nodeMap, 0);
-    const tree = Array.isArray(serializedTree)
-      ? serializedTree[0] || null
-      : serializedTree || null;
-    const interactive = extractInteractiveFromAxNodes(nodes);
-    const landmarks = extractLandmarksFromAxNodes(nodes);
-    const headings = extractHeadingsFromAxNodes(nodes);
-
-    // Build reference mapping for automation
-    const rawRefMap = await buildRefToSelectorMap(nodes, target);
+    // Build reference mapping for automation (all frames)
+    const rawRefMap = await buildRefToSelectorMap(allNodes, target, frameResults);
     const refMap = rawRefMap;
 
+    console.log(`[snapshot] Captured ${frameResults.length} frames with ${allNodes.length} total nodes, ${Object.keys(refMap).length} refs`);
+
+    // Build a map of frameId -> tree for merging
+    const frameTreeMap = new Map();
+    for (const frameData of frameResults) {
+      if (frameData.frameId && frameData.tree) {
+        frameTreeMap.set(frameData.frameId, frameData.tree);
+      }
+    }
+
+    // Build a map of backendNodeId -> frameId from DOM nodes
+    const backendNodeToFrameId = new Map();
+    try {
+      const docResponse = await sendDebuggerCommand(target, 'DOM.getDocument', {
+        depth: -1,
+        pierce: true
+      });
+
+      if (docResponse?.root) {
+        const collectIframeBackendIds = (node) => {
+          if (node.nodeName?.toLowerCase() === 'iframe') {
+            const backendId = node.backendNodeId;
+            const frameId = node.contentDocument?.frameId || node.frameId;
+            if (backendId && frameId) {
+              backendNodeToFrameId.set(backendId, frameId);
+              console.log(`[snapshot] Mapped iframe backendNodeId ${backendId} -> frameId ${frameId}`);
+            }
+          }
+          if (node.contentDocument) {
+            collectIframeBackendIds(node.contentDocument);
+          }
+          if (node.children) {
+            for (const child of node.children) {
+              collectIframeBackendIds(child);
+            }
+          }
+        };
+        collectIframeBackendIds(docResponse.root);
+      }
+    } catch (error) {
+      console.warn('[snapshot] Failed to build backendNode->frameId map:', error);
+    }
+
+    // Merge iframe content into main tree
+    const mergedTree = mergeIframeContent(mainFrame.tree, frameTreeMap, backendNodeToFrameId);
+
     return {
-      tree,
-      interactive,
-      landmarks,
-      headings,
+      tree: mergedTree, // Merged tree with iframe content
+      frames: frameResults.map(f => ({
+        ordinal: f.frameOrdinal,
+        frameId: f.frameId,
+        url: f.url,
+        name: f.name,
+        tree: f.tree
+      })), // Include all frame trees for reference
+      interactive: allInteractive,
+      landmarks: allLandmarks,
+      headings: allHeadings,
       refMap, // Include the mapping
     };
   } catch (error) {
@@ -1354,9 +1916,8 @@ async function captureRawSnapshot(tabId, fullPage = true) {
   const accessibility = await captureAccessibilityTree(tabId);
 
   if (accessibility) {
-    // Prefer DOM tree over accessibility tree because DOM tree has usable CSS refs
-    // Accessibility tree has abstract refs like s1e199 which can't be used for automation
-    const tree = fallbackAria.tree || accessibility.tree || null;
+    // Use accessibility tree with abstract refs (s1e2, s1f1e1) for consistent automation
+    const tree = accessibility.tree || fallbackAria.tree || null;
     const interactive = mergeInteractiveLists(accessibility.interactive, fallbackAria.interactive);
     const landmarks = mergeLandmarks(accessibility.landmarks, fallbackAria.landmarks);
 
@@ -1387,7 +1948,9 @@ async function captureRawSnapshot(tabId, fullPage = true) {
   return domSnapshot;
 }
 
-export async function captureSnapshotForTab(tabId, fullPage = true) {
+export async function captureSnapshotForTab(tabId, fullPage = true, detailLevel = 'deep') {
+  const previousLimits = getCurrentLimits();
+  setSnapshotLimits(detailLevel);
   try {
     const nextSequence = snapshotSequenceByTab.get(tabId) ?? 1;
     currentSnapshotPrefix = `s${nextSequence}`;
@@ -1408,12 +1971,14 @@ export async function captureSnapshotForTab(tabId, fullPage = true) {
     return snapshot;
   } catch (error) {
     throw createErrorResult('Snapshot capture failed', error);
+  } finally {
+    setSnapshotLimits(previousLimits);
   }
 }
 
-export async function captureSnapshotResponse({ tabId, status, details = [], fallbackUrl, fullPage = true }) {
+export async function captureSnapshotResponse({ tabId, status, details = [], fallbackUrl, fullPage = true, detailLevel = 'deep' }) {
   try {
-    const snapshot = await captureSnapshotForTab(tabId, fullPage);
+    const snapshot = await captureSnapshotForTab(tabId, fullPage, detailLevel);
     if (!snapshot) {
       throw new Error('Snapshot returned empty result');
     }
@@ -1451,9 +2016,49 @@ export async function captureSnapshotResponse({ tabId, status, details = [], fal
   }
 }
 
+export function mergeResponseMeta(baseMeta, nextMeta) {
+  const merged = { ...(baseMeta || {}) };
+
+  if (nextMeta?.urls?.length) {
+    merged.urls = Array.from(new Set([...(baseMeta?.urls || []), ...nextMeta.urls]));
+  }
+
+  if (Object.prototype.hasOwnProperty.call(nextMeta || {}, 'tabId')) {
+    merged.tabId = nextMeta.tabId;
+  }
+
+  return Object.keys(merged).length ? merged : undefined;
+}
+
+export function combineResultWithSnapshot(baseResult, snapshotResult, tabId) {
+  if (!snapshotResult?.ok) {
+    console.warn('[snapshot] Snapshot failed, returning base result only:', snapshotResult?.error || 'unknown error');
+    return baseResult;
+  }
+
+  const mergedContent = [...(baseResult.content || []), ...(snapshotResult.content || [])];
+  const mergedMeta = mergeResponseMeta(baseResult._meta, snapshotResult._meta);
+  const mergedData = { ...(baseResult.data || {}) };
+
+  if (snapshotResult.snapshot) {
+    mergedData.snapshot = snapshotResult.snapshot;
+  }
+
+  if (typeof tabId === 'number' && mergedData.tabId === undefined) {
+    mergedData.tabId = tabId;
+  }
+
+  return {
+    ...baseResult,
+    content: mergedContent,
+    _meta: mergedMeta,
+    data: mergedData,
+  };
+}
+
 export async function ensureTabForSnapshot(params = {}) {
-  const { toolName = 'snapshot', preferredUrl } = params;
-  const selection = await selectTab({ toolName, preferredUrl });
+  const { toolName = 'snapshot', preferredUrl, allowCreate = true } = params;
+  const selection = await selectTab({ toolName, preferredUrl, allowCreate });
   if (!selection.ok) {
     return createErrorResult(`${toolName} tab selection failed`, selection.error);
   }

@@ -3,18 +3,12 @@
 
 import {
   handleClickElement,
-  handleBrowserFillForm,
   handleTypeText,
-  handleSelectOption,
-  handlePressKey,
   handleDragElement,
-  handleBrowserRef,
 } from './automation.js';
 
 import {
-  handleVisit,
-  handleGoBack,
-  handleGoForward,
+  handleNavigate,
   handleScroll
 } from './navigation.js';
 
@@ -32,17 +26,11 @@ import {
 export const mcpToolHandlers = {
   // Automation tools
   browser_click: handleClickElement,
-  browser_fill_form: handleBrowserFillForm,
   browser_type: handleTypeText,
-  browser_select_option: handleSelectOption,
-  browser_press_key: handlePressKey,
   browser_drag: handleDragElement,
-  browser_ref: handleBrowserRef,
 
   // Navigation tools
-  browser_navigate: handleVisit,
-  browser_go_back: handleGoBack,
-  browser_go_forward: handleGoForward,
+  browser_navigate: handleNavigate,
   browser_scroll: handleScroll,
 
   // Observation tools

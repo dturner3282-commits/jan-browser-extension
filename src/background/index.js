@@ -4,12 +4,16 @@
 import {
   MessageTypes,
 } from '../constants.js';
+
+// Initialize external handler for website connections
+import { getWebStatus } from './external-handler.js';
 import {
   initializeMcpBridge,
   getBridgeStatus,
   connectBridge,
   disconnectBridge,
   updateBridgePort,
+  activateBridgeProfile,
 } from '../mcp-bridge.js';
 import {
   clearMcpRegisteredTab,
@@ -62,6 +66,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   switch (message?.type) {
     case MessageTypes.GET_BRIDGE_STATUS: {
       sendResponse(getBridgeStatus());
+      return true;
+    }
+
+    case MessageTypes.GET_WEB_STATUS: {
+      sendResponse(getWebStatus());
       return true;
     }
 
@@ -150,6 +159,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         });
       });
 
+      return true;
+    }
+
+    case MessageTypes.MCP_ACTIVATE_PROFILE: {
+      (async () => {
+        try {
+          await activateBridgeProfile();
+          sendResponse({ ok: true });
+        } catch (error) {
+          sendResponse({ ok: false, error: String(error?.message || error) });
+        }
+      })();
       return true;
     }
 

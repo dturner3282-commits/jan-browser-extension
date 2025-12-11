@@ -2,45 +2,137 @@
 // MCP Bridge observation tools: screenshot, snapshot
 
 import { selectTab, validateWindow } from '../lib/tab-manager.js';
+import { getElementRefMap } from '../lib/element-ref-map.js';
 import { captureWithTimeout } from '../lib/fetch-utils.js';
 import { SCREENSHOT_CAPTURE_TIMEOUT } from '../constants.js';
 import {
   captureSnapshotResponse,
   ensureTabForSnapshot,
+  attachDebugger,
+  detachDebugger,
+  sendDebuggerCommand,
   createErrorResult,
 } from './snapshot-utils.js';
 
-const waitForLoadCompletion = async (tabId, timeoutMs = 10000) => {
+async function captureWithDebugger(tabId) {
+  const target = { tabId };
+  await attachDebugger(target);
+  try {
+    await sendDebuggerCommand(target, 'Page.enable', {});
+    const { data } = await sendDebuggerCommand(target, 'Page.captureScreenshot', { format: 'png', fromSurface: true });
+    if (!data) {
+      throw new Error('DevTools screenshot returned no data');
+    }
+    return `data:image/png;base64,${data}`;
+  } finally {
+    try {
+      await detachDebugger(target);
+    } catch (err) {
+      console.warn('[MCP Tools] Failed to detach debugger after screenshot:', err);
+    }
+  }
+}
+
+export const waitForLoadCompletion = async (tabId, timeoutMs = 5000) => {
   const start = Date.now();
+  const pollInterval = 200;
+
   while (Date.now() - start < timeoutMs) {
     try {
       const [{ result }] = await chrome.scripting.executeScript({
         target: { tabId },
         func: () => {
           const ready = document.readyState;
-          const hasMain = !!document.querySelector('main, [role="main"], #contents');
-          const hasFeed = !!document.querySelector('ytd-rich-grid-renderer, ytd-rich-item-renderer, ytd-video-renderer');
-          const pendingNetwork = window.performance?.getEntriesByType('resource')?.some((entry) => entry.initiatorType === 'xmlhttprequest' && !entry.responseEnd);
-          return { ready, hasMain, hasFeed, pendingNetwork };
+          // Check for pending XHR/fetch requests
+          const pendingXhr = window.performance
+            ?.getEntriesByType('resource')
+            ?.some((entry) =>
+              (entry.initiatorType === 'xmlhttprequest' || entry.initiatorType === 'fetch') &&
+              !entry.responseEnd
+            ) || false;
+          // Check if body has content (basic page rendered)
+          const hasContent = document.body && document.body.children.length > 0;
+          return { ready, pendingXhr, hasContent };
         },
       });
 
+      // Page is ready when:
+      // 1. Document is complete OR interactive
+      // 2. No pending XHR/fetch requests
+      // 3. Body has some content
       if (
         result &&
         (result.ready === 'complete' || result.ready === 'interactive') &&
-        result.hasMain &&
-        (result.hasFeed || result.pendingNetwork === false)
+        !result.pendingXhr &&
+        result.hasContent
       ) {
+        // Small extra delay for any final rendering
+        await new Promise((resolve) => setTimeout(resolve, 100));
         return true;
       }
     } catch (error) {
       console.warn('[MCP Tools] waitForLoadCompletion check failed', error);
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await new Promise((resolve) => setTimeout(resolve, pollInterval));
   }
 
-  return false;
+  // Timeout reached - return true anyway to not block (page may still be usable)
+  console.warn('[MCP Tools] waitForLoadCompletion timed out after', timeoutMs, 'ms');
+  return true;
+};
+
+/**
+ * Wait for DOM mutations to quiet down to improve snapshot stability.
+ * Resolves when there have been no mutations for idleMs, or after timeoutMs.
+ */
+export const waitForDomIdle = async (tabId, { idleMs = 300, timeoutMs = 2000 } = {}) => {
+  try {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (idle, timeout) =>
+        new Promise((resolve) => {
+          const start = Date.now();
+          let idleTimer = null;
+          let timeoutTimer = null;
+          let observer = null;
+
+          const finish = (reason) => {
+            if (observer) observer.disconnect();
+            if (idleTimer) clearTimeout(idleTimer);
+            if (timeoutTimer) clearTimeout(timeoutTimer);
+            resolve({ ok: true, reason, waited: Date.now() - start });
+          };
+
+          const resetIdle = () => {
+            if (idleTimer) clearTimeout(idleTimer);
+            idleTimer = setTimeout(() => finish('idle'), idle);
+          };
+
+          try {
+            observer = new MutationObserver(() => resetIdle());
+            observer.observe(document, {
+              subtree: true,
+              childList: true,
+              attributes: true,
+              characterData: true,
+            });
+          } catch (err) {
+            finish('observer_error');
+            return;
+          }
+
+          timeoutTimer = setTimeout(() => finish('timeout'), timeout);
+          resetIdle();
+        }),
+      args: [idleMs, timeoutMs],
+    });
+
+    return result;
+  } catch (err) {
+    console.warn('[MCP Tools] waitForDomIdle failed', err);
+    return { ok: false, error: String(err) };
+  }
 };
 
 /**
@@ -49,13 +141,19 @@ const waitForLoadCompletion = async (tabId, timeoutMs = 10000) => {
 export async function handleScreenshot(params = {}) {
   console.log('[MCP Tools] screenshot called');
 
+  const includeRefs = params?.includeRefs === true;
+  const detailLevel = typeof params?.detail === 'string' ? params.detail : 'deep';
+  let overlayShown = false;
+  let lastTabId = null;
+
   try {
-    const selection = await selectTab({ requireUrl: true, toolName: 'screenshot' });
+    const selection = await selectTab({ requireUrl: true, toolName: 'screenshot', allowCreate: false });
     if (!selection.ok) {
       return createErrorResult('Screenshot failed', selection.error);
     }
 
     const { tabId, tab } = selection;
+    lastTabId = tabId;
 
     console.log('[MCP Tools] screenshot - using tab:', tabId, 'window:', tab.windowId);
 
@@ -71,59 +169,97 @@ export async function handleScreenshot(params = {}) {
     // Try to build ARIA tree and show inline refs if available
     // This is optional - if it fails quickly, we take screenshot immediately
     const startTime = Date.now();
-    try {
-      // Quick attempt to build ARIA tree - no waiting for load completion
-      const snapshotResult = await captureSnapshotResponse({
-        tabId,
-        status: '',
-        details: [],
-        fallbackUrl: tab?.url,
-        fullPage: false, // Only capture viewport for screenshot
-      });
+    if (includeRefs) {
+      try {
+        // Quick attempt to build ARIA tree - no waiting for load completion
+        const snapshotResult = await captureSnapshotResponse({
+          tabId,
+          status: '',
+          details: [],
+          fallbackUrl: tab?.url,
+          fullPage: false, // Only capture viewport for screenshot
+          detailLevel,
+        });
 
-      console.log(`[MCP Tools] ARIA tree built in ${Date.now() - startTime}ms`);
+        console.log(`[MCP Tools] ARIA tree built in ${Date.now() - startTime}ms`);
 
-      // Show visual reference overlay BEFORE taking screenshot if refMap is available
-      const refMap = snapshotResult?.snapshot?.refMap;
-      if (refMap && Object.keys(refMap).length > 0) {
-        try {
-          // Try to inject content scripts if not already loaded
+        // Show visual reference overlay BEFORE taking screenshot if refMap is available
+        const refMap = snapshotResult?.snapshot?.refMap;
+        if (refMap && Object.keys(refMap).length > 0) {
+          const overlayRefMap = Object.fromEntries(
+            Object.entries(refMap)
+              .map(([key, val]) => {
+                if (val && typeof val === 'object') {
+                  return val.css ? [key, val.css] : null;
+                }
+                return [key, val];
+              })
+              .filter(Boolean)
+          );
           try {
-            await chrome.scripting.executeScript({
-              target: { tabId },
-              files: ['content/reference-overlay.js'],
+            // Try to inject content scripts if not already loaded
+            try {
+              await chrome.scripting.executeScript({
+                target: { tabId },
+                files: ['content/reference-overlay.js'],
+              });
+              console.log('[MCP Tools] Injected reference-overlay.js');
+            } catch (injectError) {
+              // Already injected or failed - that's okay, try to send message anyway
+              console.log('[MCP Tools] reference-overlay.js already loaded or injection failed:', injectError?.message);
+            }
+
+            await chrome.tabs.sendMessage(tabId, {
+              type: 'SHOW_REFERENCE_OVERLAY',
+              payload: { refMap: overlayRefMap },
             });
-            console.log('[MCP Tools] Injected reference-overlay.js');
-          } catch (injectError) {
-            // Already injected or failed - that's okay, try to send message anyway
-            console.log('[MCP Tools] reference-overlay.js already loaded or injection failed:', injectError?.message);
+            overlayShown = true;
+            console.log('[MCP Tools] Visual reference overlay shown on tab', tabId, 'refs:', Object.keys(refMap).length);
+
+            // Wait for overlay to render before screenshot
+            await new Promise((resolve) => setTimeout(resolve, 200));
+          } catch (overlayError) {
+            console.warn('[MCP Tools] Failed to show reference overlay:', overlayError);
           }
-
-          await chrome.tabs.sendMessage(tabId, {
-            type: 'SHOW_REFERENCE_OVERLAY',
-            payload: { refMap },
-          });
-          console.log('[MCP Tools] Visual reference overlay shown on tab', tabId, 'refs:', Object.keys(refMap).length);
-
-          // Wait for overlay to render before screenshot
-          await new Promise((resolve) => setTimeout(resolve, 200));
-        } catch (overlayError) {
-          console.warn('[MCP Tools] Failed to show reference overlay:', overlayError);
+        } else {
+          console.log('[MCP Tools] No refMap available, screenshot without inline refs');
         }
-      } else {
-        console.log('[MCP Tools] No refMap available, screenshot without inline refs');
+      } catch (snapshotError) {
+        console.warn('[MCP Tools] Failed to build ARIA tree for screenshot (took', Date.now() - startTime, 'ms), proceeding without inline refs:', snapshotError);
       }
-    } catch (snapshotError) {
-      console.warn('[MCP Tools] Failed to build ARIA tree for screenshot (took', Date.now() - startTime, 'ms), proceeding without inline refs:', snapshotError);
+
+      // Fallback: if no overlay was shown, try using the cached ref map
+      if (!overlayShown) {
+        const cachedRefMap = getElementRefMap(tabId);
+        if (cachedRefMap && cachedRefMap.size > 0) {
+          const overlayRefMap = Object.fromEntries(
+            Array.from(cachedRefMap.entries())
+              .map(([key, val]) => {
+                if (val && typeof val === 'object') {
+                  return val.css ? [key, val.css] : null;
+                }
+                return [key, val];
+              })
+              .filter(Boolean)
+          );
+          try {
+            await chrome.tabs.sendMessage(tabId, {
+              type: 'SHOW_REFERENCE_OVERLAY',
+              payload: { refMap: overlayRefMap },
+            });
+            overlayShown = true;
+            console.log('[MCP Tools] Fallback overlay shown from cached ref map on tab', tabId);
+            await new Promise((resolve) => setTimeout(resolve, 200));
+          } catch (fallbackError) {
+            console.warn('[MCP Tools] Failed to show fallback reference overlay:', fallbackError);
+          }
+        }
+      }
     }
 
-    // Capture screenshot with timeout (with or without overlay)
-    console.log('[MCP Tools] screenshot - capturing from window:', tab.windowId);
-    const dataUrl = await captureWithTimeout(
-      tab.windowId,
-      { format: 'png' },
-      SCREENSHOT_CAPTURE_TIMEOUT
-    );
+    // Capture screenshot with debugger (does not steal focus).
+    console.log('[MCP Tools] screenshot - capturing via DevTools screenshot');
+    const dataUrl = await captureWithDebugger(tabId);
 
     console.log('[MCP Tools] screenshot taken', {
       url: tab.url,
@@ -167,6 +303,15 @@ export async function handleScreenshot(params = {}) {
   } catch (e) {
     console.error('[MCP Tools] screenshot error:', e);
     return createErrorResult('Screenshot failed', e);
+  } finally {
+    if (overlayShown && lastTabId !== null) {
+      try {
+        await chrome.tabs.sendMessage(lastTabId, { type: 'HIDE_REFERENCE_OVERLAY' });
+        console.log('[MCP Tools] Reference overlay hidden after screenshot');
+      } catch (hideError) {
+        console.warn('[MCP Tools] Failed to hide reference overlay after screenshot:', hideError);
+      }
+    }
   }
 }
 
@@ -175,7 +320,7 @@ export async function handleScreenshot(params = {}) {
  */
 export async function handleSnapshot(params = {}) {
   try {
-    const selection = await ensureTabForSnapshot({ toolName: 'snapshot', preferredUrl: params?.url });
+    const selection = await ensureTabForSnapshot({ toolName: 'snapshot', preferredUrl: params?.url, allowCreate: false });
     if (selection?.ok === false && selection.content) {
       return selection;
     }
@@ -187,6 +332,7 @@ export async function handleSnapshot(params = {}) {
     const status = typeof params?.status === 'string' && params.status.trim()
       ? params.status.trim()
       : 'Snapshot captured';
+    const detailLevel = typeof params?.detail === 'string' ? params.detail : 'deep';
 
     // Default to full page capture if not specified
     const fullPage = params?.fullPage !== false;
@@ -199,6 +345,7 @@ export async function handleSnapshot(params = {}) {
       details: Array.isArray(params?.details) ? params.details : [],
       fallbackUrl: params?.url || tab?.url,
       fullPage,
+      detailLevel,
     });
 
     if (!snapshotResult.ok) {
@@ -222,7 +369,7 @@ export async function handleSnapshot(params = {}) {
 
 export async function handleBrowserSnapshotYaml(params = {}) {
   try {
-    const selection = await ensureTabForSnapshot({ toolName: 'browser_snapshot', preferredUrl: params?.url });
+    const selection = await ensureTabForSnapshot({ toolName: 'browser_snapshot', preferredUrl: params?.url, allowCreate: false });
     if (selection?.ok === false && selection.content) {
       return selection;
     }
@@ -234,6 +381,7 @@ export async function handleBrowserSnapshotYaml(params = {}) {
     const status = typeof params?.status === 'string' && params.status.trim()
       ? params.status.trim()
       : 'Snapshot captured';
+    const detailLevel = typeof params?.detail === 'string' ? params.detail : 'deep';
 
     await waitForLoadCompletion(tabId);
 
@@ -243,6 +391,7 @@ export async function handleBrowserSnapshotYaml(params = {}) {
       details: Array.isArray(params?.details) ? params.details : [],
       fallbackUrl: params?.url || tab?.url,
       fullPage: params?.fullPage !== false,
+      detailLevel,
     });
 
     if (!snapshotResult.ok) {
@@ -266,7 +415,7 @@ export async function handleBrowserSnapshotYaml(params = {}) {
 
 export async function handleGetUrl(params = {}) {
   try {
-    const selection = await ensureTabForSnapshot({ toolName: 'getUrl', preferredUrl: params?.url });
+    const selection = await ensureTabForSnapshot({ toolName: 'getUrl', preferredUrl: params?.url, allowCreate: false });
     if (selection?.ok === false && selection.content) {
       return selection;
     }
@@ -301,7 +450,7 @@ export async function handleGetUrl(params = {}) {
 
 export async function handleGetTitle(params = {}) {
   try {
-    const selection = await ensureTabForSnapshot({ toolName: 'getTitle', preferredUrl: params?.url });
+    const selection = await ensureTabForSnapshot({ toolName: 'getTitle', preferredUrl: params?.url, allowCreate: false });
     if (selection?.ok === false && selection.content) {
       return selection;
     }

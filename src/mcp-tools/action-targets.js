@@ -2,33 +2,96 @@
 // Element resolution and capability checks for automation actions
 
 import { ELEMENT_ACTION_CAPABILITIES } from './element-action-map.js';
-import { getElementSelector, hasElementRefMap } from '../lib/element-ref-map.js';
+import { getElementSelector, hasElementRefMap, getBackendNodeId, getFrameId, hasRef, getRefMetadata } from '../lib/element-ref-map.js';
 
 export function resolveAccessibilityRef(ref, tabId) {
   const normalized = typeof ref === 'string' ? ref.trim() : '';
-  const isAccessibilityRef = normalized && /^s\d+e\d+$/i.test(normalized);
+  // Updated pattern to match iframe refs: s1e1 or s1f1e5
+  const isAccessibilityRef = normalized && /^s\d+(?:f\d+)?e\d+$/i.test(normalized);
 
   if (!isAccessibilityRef) {
-    return { ok: true, value: normalized, originalRef: normalized, usedSnapshot: false };
+    return { ok: true, value: normalized, originalRef: normalized, usedSnapshot: false, backendValue: null, cssValue: normalized, frameId: null };
   }
 
   const snapshotAvailable = hasElementRefMap(tabId);
   if (!snapshotAvailable) {
-    return { ok: true, value: normalized, originalRef: normalized, usedSnapshot: false };
+    return { ok: true, value: normalized, originalRef: normalized, usedSnapshot: false, backendValue: null, cssValue: normalized, frameId: null };
   }
 
   const mappedSelector = getElementSelector(tabId, normalized);
-  if (!mappedSelector) {
+  const backendId = getBackendNodeId(tabId, normalized);
+  const frameId = getFrameId(tabId, normalized);
+  const backendValue = backendId !== null ? `backend:${backendId}` : null;
+  const refExists = hasRef(tabId, normalized);
+  const { parentRef, childIndex } = getRefMetadata(tabId, normalized);
+
+  // Check if ref exists at all (including placeholder refs)
+  if (!refExists) {
     return {
       ok: false,
       value: null,
       originalRef: normalized,
       usedSnapshot: true,
+      frameId: null,
       error: `Reference ${normalized} was not found in the latest snapshot. Capture a fresh snapshot and try again.`,
     };
   }
 
-  return { ok: true, value: mappedSelector, originalRef: normalized, usedSnapshot: true };
+  // If ref exists but has no selector/backend, it's a placeholder - still allow it with frameId
+  if (!mappedSelector && backendId === null) {
+    console.warn(`[action-targets] Ref ${normalized} is a placeholder (no selector/backend) - will use allFrames search`);
+    return {
+      ok: true,
+      value: normalized, // Return the ref itself for allFrames search
+      originalRef: normalized,
+      usedSnapshot: true,
+      backendValue: null,
+      cssValue: null,
+      frameId, // Include frameId so allFrames can be used
+      isPlaceholder: true,
+    };
+  }
+
+  // Prefer backend for click durability but carry css fallback
+  if (backendValue) {
+    return {
+      ok: true,
+      value: backendValue,
+      originalRef: normalized,
+      usedSnapshot: true,
+      backendValue,
+      cssValue: mappedSelector || null,
+      frameId, // Include frameId for iframe elements
+      parentRef,
+      childIndex,
+    };
+  }
+
+  if (mappedSelector) {
+    return {
+      ok: true,
+      value: mappedSelector,
+      originalRef: normalized,
+      usedSnapshot: true,
+      backendValue: null,
+      cssValue: mappedSelector,
+      frameId,
+      parentRef,
+      childIndex,
+    };
+  }
+
+  return {
+    ok: true,
+    value: normalized,
+    originalRef: normalized,
+    usedSnapshot: true,
+    backendValue: null,
+    cssValue: null,
+    frameId,
+    parentRef,
+    childIndex,
+  };
 }
 
 /**
@@ -43,6 +106,16 @@ export async function resolveBackendNodeToPoint(tabId, backendNodeId) {
     await chrome.debugger.attach(target, '1.3');
 
     try {
+      try {
+        await chrome.debugger.sendCommand(target, 'DOM.scrollIntoViewIfNeeded', {
+          backendNodeId,
+        });
+        // Wait for scroll to complete and layout to stabilize
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      } catch (err) {
+        console.warn('[Action Targets] scrollIntoViewIfNeeded failed:', err);
+      }
+
       const { model } = await chrome.debugger.sendCommand(target, 'DOM.getBoxModel', {
         backendNodeId,
       });
@@ -53,9 +126,32 @@ export async function resolveBackendNodeToPoint(tabId, backendNodeId) {
         const ys = [model.content[1], model.content[3], model.content[5], model.content[7]];
         const centerX = xs.reduce((a, b) => a + b, 0) / 4;
         const centerY = ys.reduce((a, b) => a + b, 0) / 4;
+        const left = Math.min(...xs);
+        const right = Math.max(...xs);
+        const top = Math.min(...ys);
+        const bottom = Math.max(...ys);
+
+        console.log(`[Action Targets] Backend node ${backendNodeId} box model:`, {
+          content: model.content,
+          center: { x: Math.round(centerX), y: Math.round(centerY) },
+          bounds: { left, top, right, bottom, width: right - left, height: bottom - top },
+        });
 
         await chrome.debugger.detach(target);
-        return { x: Math.round(centerX), y: Math.round(centerY) };
+        return {
+          x: Math.round(centerX),
+          y: Math.round(centerY),
+          boundingRect: {
+            x: left,
+            y: top,
+            left,
+            top,
+            right,
+            bottom,
+            width: right - left,
+            height: bottom - top,
+          },
+        };
       }
 
       await chrome.debugger.detach(target);
@@ -70,9 +166,16 @@ export async function resolveBackendNodeToPoint(tabId, backendNodeId) {
   }
 }
 
-export async function prepareElementForAction(tabId, { ref, mode }) {
+export async function prepareElementForAction(tabId, { ref, mode, frameId }) {
+  // Build target - if this is an iframe element, execute in all frames
+  const target = { tabId };
+  if (frameId) {
+    // Use allFrames to execute in all frames (main + iframes)
+    target.allFrames = true;
+  }
+
   const [{ result }] = await chrome.scripting.executeScript({
-    target: { tabId },
+    target,
     func: async ({ ref, mode, capabilityMap }) => {
       const resolveElementFromRef = (reference) => {
         if (typeof reference !== 'string' || reference.length === 0) {
@@ -321,16 +424,29 @@ export async function prepareElementForAction(tabId, { ref, mode }) {
       const waitForLayout = () =>
         new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
+      // Try to bring the element (or its option) into view before measuring/clicking
+      try {
+        if (typeof el.scrollIntoView === 'function') {
+          el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        }
+      } catch (err) {
+        try {
+          el.scrollIntoView();
+        } catch (_) {
+          // ignore
+        }
+      }
+
       await waitForLayout();
 
       const targetRect = el.getBoundingClientRect();
-      const visualViewport = window.visualViewport;
-      const viewportX = visualViewport ? visualViewport.offsetLeft : 0;
-      const viewportY = visualViewport ? visualViewport.offsetTop : 0;
 
+      // getBoundingClientRect() returns coordinates relative to the viewport
+      // Input.dispatchMouseEvent expects viewport-relative coordinates
+      // No additional offset needed - visualViewport.offset* only applies for pinch-zoom scenarios
       const clickPoint = {
-        x: targetRect.left + viewportX + targetRect.width / 2,
-        y: targetRect.top + viewportY + targetRect.height / 2,
+        x: targetRect.left + targetRect.width / 2,
+        y: targetRect.top + targetRect.height / 2,
       };
 
       const detectedElement = buildDetectedElement(el);
@@ -412,10 +528,7 @@ export async function getElementDetails(tabId, ref) {
         return { success: false, error: 'Element not found' };
       }
 
-      const rect = el.getBoundingClientRect?.();
-      const visualViewport = window.visualViewport;
-      const viewportX = visualViewport ? visualViewport.offsetLeft : 0;
-      const viewportY = visualViewport ? visualViewport.offsetTop : 0;
+      const rect = el?.getBoundingClientRect ? el.getBoundingClientRect() : null;
 
       const detectedElement = {
         tagName: el.tagName || 'unknown',
@@ -432,16 +545,62 @@ export async function getElementDetails(tabId, ref) {
       };
 
       const boundingRect = rect ? { ...rect.toJSON?.(), x: rect.x, y: rect.y } : null;
+      let clickPoint = null;
+      if (rect) {
+        clickPoint = {
+          x: rect.left + viewportX + rect.width / 2,
+          y: rect.top + viewportY + rect.height / 2,
+        };
+      }
+
+      return { success: true, detectedElement, boundingRect, clickPoint };
+    },
+    args: [{ ref }],
+  });
+
+  return result;
+}
+
+export async function getElementDetailsAtPoint(tabId, point) {
+  if (!point || typeof point.x !== 'number' || typeof point.y !== 'number') {
+    return { success: false, error: 'Invalid coordinates' };
+  }
+
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: ({ x, y }) => {
+      const element = document.elementFromPoint(x, y);
+      if (!element) {
+        return { success: false, error: `No element found at coordinates (${x}, ${y})` };
+      }
+
+      const rect = element.getBoundingClientRect?.();
+
+      const detectedElement = {
+        tagName: element.tagName || 'unknown',
+        role: element.getAttribute?.('role') || null,
+        id: element.id || null,
+        className: element.className || null,
+        name: element.getAttribute?.('name') || null,
+        type: element.getAttribute?.('type') || null,
+        ariaLabel: element.getAttribute?.('aria-label') || null,
+        ariaDescription: element.getAttribute?.('aria-description') || null,
+        placeholder: element.getAttribute?.('placeholder') || null,
+        text: (element.textContent || '').trim().slice(0, 500) || null,
+        value: element.value !== undefined ? String(element.value).slice(0, 200) : null,
+      };
+
+      const boundingRect = rect ? { ...rect.toJSON?.(), x: rect.x, y: rect.y } : null;
       const clickPoint = rect
         ? {
             x: rect.left + viewportX + rect.width / 2,
             y: rect.top + viewportY + rect.height / 2,
           }
-        : null;
+        : { x, y };
 
       return { success: true, detectedElement, boundingRect, clickPoint };
     },
-    args: [{ ref }],
+    args: [{ x: Number(point.x), y: Number(point.y) }],
   });
 
   return result;

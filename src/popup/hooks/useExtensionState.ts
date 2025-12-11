@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { DEFAULT_BRIDGE_PORT } from '../../constants.js';
 import {
@@ -7,7 +7,11 @@ import {
   fetchBridgeStatus,
   persistBridgePort,
   subscribeToBridgeUpdates,
+  activateCurrentProfile,
+  fetchWebStatus,
+  subscribeToWebUpdates,
   type BridgeStatus,
+  type WebStatus,
 } from '../logic/bridge';
 import {
   clearRegisteredTab,
@@ -45,12 +49,25 @@ export interface UseExtensionStateResult {
     action: 'connect' | 'disconnect';
     actionLabel: string;
     showSpinner: boolean;
+    tone: 'connected' | 'connecting' | 'disconnected';
+  };
+  web: {
+    connected: boolean;
+    count: number;
   };
   tab: {
     state: TabState;
     statusLabel: string;
     message: string;
     actions: TabAction[];
+  };
+  profile: {
+    showSelector: boolean;
+    isActive: boolean;
+    label: string;
+    statusLabel: string;
+    actionLabel?: string;
+    hideTabSection: boolean;
   };
   settings: SettingsState;
   actions: {
@@ -60,6 +77,7 @@ export interface UseExtensionStateResult {
     closeSettings: () => void;
     resetSettingsMessage: () => void;
     savePort: (value: string) => Promise<void>;
+    activateProfile: () => Promise<void>;
   };
 }
 
@@ -68,6 +86,11 @@ const INITIAL_BRIDGE_STATE: BridgeState = {
   reconnecting: false,
   port: DEFAULT_BRIDGE_PORT,
   lastError: null,
+  profileId: null,
+  profileLabel: null,
+  activeProfileId: null,
+  profileCount: 1,
+  isActiveProfile: true,
 };
 
 const INITIAL_TAB_STATE: TabState = {
@@ -83,22 +106,32 @@ const INITIAL_SETTINGS_STATE: SettingsState = {
   error: false,
 };
 
+const INITIAL_WEB_STATUS: WebStatus = {
+  connected: false,
+  count: 0,
+};
+
 function computeBridgeUi(state: BridgeState) {
   const status = state.status || 'idle';
   const reconnecting = Boolean(state.reconnecting);
   let statusLabel = 'Disconnected';
   let showSpinner = false;
+  let tone: 'connected' | 'connecting' | 'disconnected' = 'disconnected';
 
   if (status === 'connecting') {
     statusLabel = 'Connecting…';
     showSpinner = true;
+    tone = 'connecting';
   } else if (status === 'connected' || status === 'ready') {
     statusLabel = 'Connected';
+    tone = 'connected';
   } else if (status === 'disconnected' || (status === 'error' && reconnecting)) {
     statusLabel = reconnecting ? 'Reconnecting…' : 'Disconnected';
     showSpinner = reconnecting;
+    tone = reconnecting ? 'connecting' : 'disconnected';
   } else if (status === 'error') {
     statusLabel = 'Error';
+    tone = 'disconnected';
   }
 
   const action: 'connect' | 'disconnect' =
@@ -111,9 +144,10 @@ function computeBridgeUi(state: BridgeState) {
       : 'connect';
 
   const actionLabel = action === 'disconnect' ? 'Disconnect' : 'Connect';
-  const detail = `Port ${state.port}`;
+  const detailParts = [`Port ${state.port}`];
+  const detail = detailParts.join(' • ');
 
-  return { statusLabel, detail, action, actionLabel, showSpinner };
+  return { statusLabel, detail, action, actionLabel, showSpinner, tone };
 }
 
 function buildTabActions(options: {
@@ -164,8 +198,10 @@ function buildTabActions(options: {
 
 export function useExtensionState(): UseExtensionStateResult {
   const [bridgeState, setBridgeState] = useState<BridgeState>(INITIAL_BRIDGE_STATE);
+  const [webStatus, setWebStatus] = useState<WebStatus>(INITIAL_WEB_STATUS);
   const [tabState, setTabState] = useState<TabState>(INITIAL_TAB_STATE);
   const [settingsState, setSettingsState] = useState<SettingsState>(INITIAL_SETTINGS_STATE);
+  const autoConnectAttemptedRef = useRef(false);
 
   const refreshBridge = useCallback(async () => {
     const status = await fetchBridgeStatus();
@@ -189,6 +225,11 @@ export function useExtensionState(): UseExtensionStateResult {
     });
   }, []);
 
+  const refreshWeb = useCallback(async () => {
+    const status = await fetchWebStatus();
+    setWebStatus(status);
+  }, []);
+
   const refreshTab = useCallback(async () => {
     const [active, registered] = await Promise.all([fetchActiveTab(), fetchRegisteredTabId()]);
     setTabState((current) => ({
@@ -199,6 +240,7 @@ export function useExtensionState(): UseExtensionStateResult {
     }));
   }, []);
 
+  // Subscribe to bridge status updates
   useEffect(() => {
     const unsubscribe = subscribeToBridgeUpdates((update) => {
       setBridgeState((current) => {
@@ -224,10 +266,28 @@ export function useExtensionState(): UseExtensionStateResult {
     return unsubscribe;
   }, []);
 
+  // Subscribe to web status updates
+  useEffect(() => {
+    const unsubscribe = subscribeToWebUpdates((update) => {
+      setWebStatus(update);
+    });
+
+    return unsubscribe;
+  }, []);
+
+  // Initial fetch
   useEffect(() => {
     void refreshBridge();
+    void refreshWeb();
     void refreshTab();
-  }, [refreshBridge, refreshTab]);
+  }, [refreshBridge, refreshWeb, refreshTab]);
+
+  // Auto-connect to bridge on mount
+  useEffect(() => {
+    if (autoConnectAttemptedRef.current) return;
+    autoConnectAttemptedRef.current = true;
+    void connectBridge({ auto: true });
+  }, []);
 
   const registerCurrentTab = useCallback(async () => {
     const activeId = tabState.activeTab?.id;
@@ -264,6 +324,14 @@ export function useExtensionState(): UseExtensionStateResult {
     }
     await refreshTab();
   }, [refreshTab]);
+
+  const activateProfile = useCallback(async () => {
+    const ok = await activateCurrentProfile();
+    if (!ok) {
+      setBridgeState((current) => ({ ...current, lastError: 'Failed to activate this profile.' }));
+    }
+    await refreshBridge();
+  }, [refreshBridge]);
 
   const toggleBridge = useCallback(
     async (action: 'connect' | 'disconnect') => {
@@ -341,6 +409,10 @@ export function useExtensionState(): UseExtensionStateResult {
 
       setBridgeState((current) => ({ ...current, port: parsed }));
       setSettingsState((current) => ({ ...current, saving: false, open: false, message: '', error: false }));
+      const ok = await connectBridge({ port: parsed });
+      if (!ok) {
+        setBridgeState((current) => ({ ...current, lastError: 'Failed to connect bridge.' }));
+      }
       await refreshBridge();
     },
     [bridgeState.port, closeSettings, refreshBridge],
@@ -372,19 +444,34 @@ export function useExtensionState(): UseExtensionStateResult {
     return { state: tabState, statusLabel, message, actions };
   }, [tabState, registerCurrentTab, clearRegistered, focusRegistered]);
 
+  const profileUi = useMemo(() => {
+    const profileCount = bridgeState.profileCount ?? 1;
+    const isActive = bridgeState.isActiveProfile !== false;
+    const label = 'User Profile';
+    const showSelector = profileCount > 1;
+    const hideTabSection = showSelector && !isActive;
+    const statusLabel = isActive ? 'Status: Active' : 'Status: Not Active';
+    const actionLabel = !isActive ? 'Use this Profile' : undefined;
+
+    return { showSelector, isActive, label, statusLabel, actionLabel, hideTabSection };
+  }, [bridgeState.profileCount, bridgeState.isActiveProfile]);
+
   return {
     bridge: { state: bridgeState, ...bridgeUi },
+    web: webStatus,
     tab: tabUi,
+    profile: profileUi,
     settings: settingsState,
     actions: {
       refresh: async () => {
-        await Promise.all([refreshBridge(), refreshTab()]);
+        await Promise.all([refreshBridge(), refreshWeb(), refreshTab()]);
       },
       toggleBridge,
       openSettings,
       closeSettings,
       resetSettingsMessage,
       savePort,
+      activateProfile,
     },
   };
 }

@@ -3,48 +3,38 @@
 
 import { selectTab, setMcpRegisteredTab, getMcpRegisteredTab } from '../lib/tab-manager.js';
 import { CONTENT_LOAD_TIMEOUT, TAB_REGISTRATION_DELAY, VisitOutputModes } from '../constants.js';
-import { createErrorResult, clearSnapshotsForTab } from './snapshot-utils.js';
+import { captureSnapshotResponse, clearSnapshotsForTab, combineResultWithSnapshot, createErrorResult } from './snapshot-utils.js';
+import { waitForLoadCompletion, waitForDomIdle } from './observation.js';
+import { resolveAccessibilityRef, resolveBackendNodeToPoint } from './action-targets.js';
 
-const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export async function handleNavigate(params = {}) {
+  const rawTarget = typeof params?.target === 'string' ? params.target.trim() : '';
+  const direction = typeof params?.direction === 'string' ? params.direction.trim() : '';
+  const fallback = typeof params?.url === 'string' ? params.url.trim() : '';
+  const target = rawTarget || direction || fallback;
+  const UNSAFE_PROTOCOL_PATTERN =
+    /^(javascript:|data:|file:|vbscript:|chrome:|edge:|safari-extension:|moz-extension:|opera:)/i;
 
-const waitForPageReady = async (tabId, timeoutMs = 10000) => {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const [{ result }] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          const ready = document.readyState;
-          const hasMain = !!document.querySelector('main, [role="main"], #contents');
-          const feedEl = document.querySelector(
-            'ytd-rich-grid-renderer, ytd-rich-item-renderer, ytd-video-renderer, [data-testid="feed"]'
-          );
-          const pendingRequests =
-            window.performance?.getEntriesByType('resource')?.some(
-              (entry) => entry.initiatorType === 'xmlhttprequest' && entry.responseEnd === 0,
-            ) || false;
-
-          return { ready, hasMain, hasFeed: !!feedEl, pendingRequests };
-        },
-      });
-
-      if (
-        result &&
-        (result.ready === 'complete' || result.ready === 'interactive') &&
-        (result.hasMain || result.hasFeed) &&
-        result.pendingRequests === false
-      ) {
-        return true;
-      }
-    } catch (error) {
-      console.warn('[MCP Tools] waitForPageReady check failed', error);
-    }
-
-    await wait(250);
+  if (!target) {
+    return createErrorResult('Navigate failed', 'Missing target (URL or "back"/"forward")');
   }
 
-  return false;
-};
+  const lowered = target.toLowerCase();
+  if (lowered === 'back' || lowered === 'backward') {
+    return handleGoBack(params);
+  }
+  if (lowered === 'forward') {
+    return handleGoForward(params);
+  }
+
+  if (UNSAFE_PROTOCOL_PATTERN.test(target)) {
+    return createErrorResult('Navigate failed', 'Unsafe navigation target rejected');
+  }
+
+  const normalizedTarget = target.match(/^https?:\/\//i) ? target : `https://${target}`;
+
+  return handleVisit({ ...params, url: normalizedTarget });
+}
 
 /**
  * Visits a URL and extracts page content
@@ -113,7 +103,7 @@ export async function handleVisit(params) {
       chrome.tabs.onUpdated.addListener(listener);
     });
 
-    await waitForPageReady(tabId);
+    await waitForLoadCompletion(tabId);
 
     // Extract page content
     const response = await chrome.tabs.sendMessage(tabId, { type: 'GET_PAGE_CONTENT' });
@@ -150,6 +140,13 @@ export async function handleVisit(params) {
       result.markdown = String(response.content || '').slice(0, maxContentLength);
     }
 
+    const snapshotResult = await captureSnapshotResponse({
+      tabId,
+      status: 'Snapshot after navigate',
+      details: result.url ? [`URL: ${result.url}`] : [],
+      fallbackUrl: result.url,
+    });
+
     // By default, keep tabs open for agentic workflows
     // Only close if explicitly requested
     if (closeTab) {
@@ -164,11 +161,8 @@ export async function handleVisit(params) {
         console.log('[MCP Tools] Navigated existing registered tab:', tabId);
       }
 
-      // Focus the tab's window first, then activate the tab
-      const currentTab = await chrome.tabs.get(tabId);
-      await chrome.windows.update(currentTab.windowId, { focused: true });
-      await chrome.tabs.update(tabId, { active: true });
-      console.log('[MCP Tools] Tab is now active and visible in focused window');
+      // Keep the tab available for follow-up actions without stealing focus
+      console.log('[MCP Tools] Tab registered without changing active window/tab focus');
     }
 
     console.log('[MCP Tools] visit result', {
@@ -203,7 +197,7 @@ export async function handleVisit(params) {
       result.tabId = null;
     }
 
-    return {
+    const baseResult = {
       ok: true,
       content: [
         {
@@ -214,6 +208,8 @@ export async function handleVisit(params) {
       _meta: Object.keys(meta).length ? meta : undefined,
       data: result,
     };
+
+    return combineResultWithSnapshot(baseResult, snapshotResult, tabId);
   } catch (e) {
     console.error('[MCP Tools] visit error:', e);
     return createErrorResult('Visit failed', e);
@@ -225,7 +221,7 @@ export async function handleVisit(params) {
  */
 export async function handleGoBack(params) {
   try {
-    const selection = await selectTab({ toolName: 'go_back' });
+    const selection = await selectTab({ toolName: 'browser_navigate', allowCreate: false });
     if (!selection.ok) {
       return createErrorResult('Go back failed', selection.error);
     }
@@ -234,6 +230,9 @@ export async function handleGoBack(params) {
 
     await chrome.tabs.goBack(tabId);
     await new Promise((resolve) => setTimeout(resolve, TAB_REGISTRATION_DELAY));
+    await waitForLoadCompletion(tabId);
+    await waitForDomIdle(tabId);
+    await new Promise((resolve) => setTimeout(resolve, 200));
 
     const finalTab = await chrome.tabs.get(tabId);
     clearSnapshotsForTab(tabId);
@@ -242,7 +241,14 @@ export async function handleGoBack(params) {
     if (finalTab.url) meta.urls = [finalTab.url];
     if (typeof tabId === 'number') meta.tabId = tabId;
 
-    return {
+    const snapshotResult = await captureSnapshotResponse({
+      tabId,
+      status: 'Snapshot after navigate back',
+      details: finalTab.url ? [`URL: ${finalTab.url}`] : [],
+      fallbackUrl: finalTab.url,
+    });
+
+    const baseResult = {
       ok: true,
       content: [
         {
@@ -257,6 +263,8 @@ export async function handleGoBack(params) {
         tabId,
       },
     };
+
+    return combineResultWithSnapshot(baseResult, snapshotResult, tabId);
   } catch (e) {
     console.error('[MCP Tools] go_back error:', e);
     return createErrorResult('Go back failed', e);
@@ -268,7 +276,7 @@ export async function handleGoBack(params) {
  */
 export async function handleGoForward(params) {
   try {
-    const selection = await selectTab({ toolName: 'go_forward' });
+    const selection = await selectTab({ toolName: 'browser_navigate', allowCreate: false });
     if (!selection.ok) {
       return createErrorResult('Go forward failed', selection.error);
     }
@@ -277,6 +285,9 @@ export async function handleGoForward(params) {
 
     await chrome.tabs.goForward(tabId);
     await new Promise((resolve) => setTimeout(resolve, TAB_REGISTRATION_DELAY));
+    await waitForLoadCompletion(tabId);
+    await waitForDomIdle(tabId);
+    await new Promise((resolve) => setTimeout(resolve, 200));
 
     const finalTab = await chrome.tabs.get(tabId);
     clearSnapshotsForTab(tabId);
@@ -285,7 +296,14 @@ export async function handleGoForward(params) {
     if (finalTab.url) meta.urls = [finalTab.url];
     if (typeof tabId === 'number') meta.tabId = tabId;
 
-    return {
+    const snapshotResult = await captureSnapshotResponse({
+      tabId,
+      status: 'Snapshot after navigate forward',
+      details: finalTab.url ? [`URL: ${finalTab.url}`] : [],
+      fallbackUrl: finalTab.url,
+    });
+
+    const baseResult = {
       ok: true,
       content: [
         {
@@ -300,6 +318,8 @@ export async function handleGoForward(params) {
         tabId,
       },
     };
+
+    return combineResultWithSnapshot(baseResult, snapshotResult, tabId);
   } catch (e) {
     console.error('[MCP Tools] go_forward error:', e);
     return createErrorResult('Go forward failed', e);
@@ -311,46 +331,299 @@ export async function handleGoForward(params) {
  */
 export async function handleScroll(params) {
   const direction = String(params?.direction || 'down');
-  const amount = Number(params?.amount) || 500;
+  const rawAmount = Number(params?.amount);
+  const amount = Number.isFinite(rawAmount) ? rawAmount : 500;
+  const targetRef = typeof params?.target === 'string' ? params.target.trim() : '';
 
   try {
-    const selection = await selectTab({ toolName: 'browser_scroll' });
+    const selection = await selectTab({ toolName: 'browser_scroll', allowCreate: false });
     if (!selection.ok) {
       return createErrorResult('Scroll failed', selection.error);
     }
 
     const { tabId, tab } = selection;
 
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: (dir, amt) => {
-        if (dir === 'top') window.scrollTo(0, 0);
-        else if (dir === 'bottom') window.scrollTo(0, document.body.scrollHeight);
-        else if (dir === 'up') window.scrollBy(0, -amt);
-        else window.scrollBy(0, amt);
-      },
-      args: [direction, amount],
-    });
+    const resolvedTarget = targetRef
+      ? resolveAccessibilityRef(targetRef, tabId)
+      : { ok: true, value: '', cssValue: '', backendValue: null };
+
+    if (!resolvedTarget.ok) {
+      return createErrorResult('Scroll failed', resolvedTarget.error);
+    }
+
+    const backendNodeId = resolvedTarget.backendValue?.startsWith('backend:')
+      ? Number(resolvedTarget.backendValue.slice('backend:'.length))
+      : null;
+
+    const resolvedRef = resolvedTarget.cssValue || resolvedTarget.value || '';
+    let scrollResult = null;
+
+    if (backendNodeId && !resolvedTarget.cssValue) {
+      const backendPoint = await resolveBackendNodeToPoint(tabId, backendNodeId);
+      if (!backendPoint) {
+        return createErrorResult('Scroll failed', 'Could not resolve element position for provided ref');
+      }
+
+      const target = { tabId };
+      const deltaY =
+        direction === 'top'
+          ? -Math.max(amount, 1200)
+          : direction === 'bottom'
+          ? Math.max(amount, 1200)
+          : direction === 'up'
+          ? -amount
+          : amount;
+
+      try {
+        await chrome.debugger.attach(target, '1.3');
+        await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+          type: 'mouseMoved',
+          x: backendPoint.x,
+          y: backendPoint.y,
+        });
+        await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+          type: 'mouseWheel',
+          x: backendPoint.x,
+          y: backendPoint.y,
+          deltaY,
+          deltaX: 0,
+        });
+        scrollResult = {
+          success: true,
+          direction,
+          amount: direction === 'up' || direction === 'down' ? Math.abs(deltaY) : null,
+          target: resolvedRef || targetRef,
+          scrolledElement: true,
+          pointerBased: true,
+          boundingRect: backendPoint.boundingRect || null,
+        };
+      } catch (err) {
+        return createErrorResult('Scroll failed', err?.message || err);
+      } finally {
+        try {
+          await chrome.debugger.detach(target);
+        } catch (detachErr) {
+          console.warn('[MCP Tools] scroll detach warning:', detachErr);
+        }
+      }
+    } else {
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (dir, amt, ref) => {
+          const scrollWithin = (el) => {
+            if (!el) return false;
+            if (dir === 'top') {
+              el.scrollTo ? el.scrollTo({ top: 0, behavior: 'auto' }) : (el.scrollTop = 0);
+            } else if (dir === 'bottom') {
+              const max = el.scrollHeight ?? document.body.scrollHeight;
+              el.scrollTo ? el.scrollTo({ top: max, behavior: 'auto' }) : (el.scrollTop = max);
+            } else if (dir === 'up') {
+              el.scrollBy ? el.scrollBy({ top: -amt, behavior: 'auto' }) : (el.scrollTop -= amt);
+            } else {
+              el.scrollBy ? el.scrollBy({ top: amt, behavior: 'auto' }) : (el.scrollTop += amt);
+            }
+            return true;
+          };
+
+          const resolveElementFromRef = (reference) => {
+            if (typeof reference !== 'string' || reference.length === 0) return null;
+
+            if (reference.includes('##')) {
+              const parts = reference.split('##');
+              let current = null;
+              if (parts[0].startsWith('css:')) {
+                const hostSelector = parts[0].slice(4);
+                try {
+                  current = document.querySelector(hostSelector);
+                } catch (err) {
+                  return null;
+                }
+              }
+              if (!current) return null;
+              for (let i = 1; i < parts.length; i++) {
+                if (!current.shadowRoot) return null;
+                try {
+                  current = current.shadowRoot.querySelector(parts[i]);
+                } catch (err) {
+                  return null;
+                }
+                if (!current) return null;
+              }
+              return current;
+            }
+
+            if (reference.startsWith('css:')) {
+              const selectorText = reference.slice(4);
+              if (!selectorText) return null;
+              try {
+                return document.querySelector(selectorText);
+              } catch (err) {
+                return null;
+              }
+            }
+
+            try {
+              let element = document.querySelector(`[data-aria-id="${reference}"]`);
+              if (element) return element;
+              element = document.getElementById(reference);
+              if (element) return element;
+              element = document.querySelector(reference);
+              if (element) return element;
+            } catch (err) {
+              // ignore
+            }
+            return null;
+          };
+
+          if (ref) {
+            const el = resolveElementFromRef(ref);
+            if (!el) {
+              return { success: false, error: 'Element not found for provided ref', direction: dir, amount: amt, target: ref };
+            }
+            scrollWithin(el);
+            return {
+              success: true,
+              direction: dir,
+              amount: dir === 'up' || dir === 'down' ? amt : null,
+              target: ref,
+              scrolledElement: true,
+            };
+          }
+
+          scrollWithin(window);
+          return {
+            success: true,
+            direction: dir,
+            amount: dir === 'up' || dir === 'down' ? amt : null,
+            target: null,
+            scrolledElement: false,
+          };
+        },
+        args: [direction, amount, resolvedRef],
+      });
+
+      scrollResult = result;
+    }
 
     await new Promise((resolve) => setTimeout(resolve, 500));
+
+    if (!scrollResult?.success) {
+      return createErrorResult('Scroll failed', scrollResult?.error || 'Unknown scroll error');
+    }
 
     const meta = {};
     if (tab?.url) meta.urls = [tab.url];
     if (typeof tabId === 'number') meta.tabId = tabId;
+
+    if (scrollResult.boundingRect) {
+      meta.boundingRect = scrollResult.boundingRect;
+    }
+
+    if (scrollResult.scrolledElement && resolvedRef && !scrollResult.pointerBased) {
+      const [{ result: elementMeta }] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (ref) => {
+          const resolveElementFromRef = (reference) => {
+            if (typeof reference !== 'string' || reference.length === 0) return null;
+
+            if (reference.includes('##')) {
+              const parts = reference.split('##');
+              let current = null;
+              if (parts[0].startsWith('css:')) {
+                const hostSelector = parts[0].slice(4);
+                try {
+                  current = document.querySelector(hostSelector);
+                } catch (err) {
+                  return null;
+                }
+              }
+              if (!current) return null;
+              for (let i = 1; i < parts.length; i++) {
+                if (!current.shadowRoot) return null;
+                try {
+                  current = current.shadowRoot.querySelector(parts[i]);
+                } catch (err) {
+                  return null;
+                }
+                if (!current) return null;
+              }
+              return current;
+            }
+
+            if (reference.startsWith('css:')) {
+              const selectorText = reference.slice(4);
+              if (!selectorText) return null;
+              try {
+                return document.querySelector(selectorText);
+              } catch (err) {
+                return null;
+              }
+            }
+
+            try {
+              let element = document.querySelector(`[data-aria-id="${reference}"]`);
+              if (element) return element;
+              element = document.getElementById(reference);
+              if (element) return element;
+              element = document.querySelector(reference);
+              if (element) return element;
+            } catch (err) {
+              // ignore
+            }
+            return null;
+          };
+
+          const element = resolveElementFromRef(ref);
+          if (!element) return { boundingRect: null, scrollTop: null };
+          const rect = element.getBoundingClientRect?.();
+          return {
+            boundingRect: rect
+              ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height, top: rect.top, left: rect.left }
+              : null,
+            scrollTop: element.scrollTop ?? null,
+          };
+        },
+        args: [resolvedRef],
+      });
+
+      if (elementMeta?.boundingRect) meta.boundingRect = elementMeta.boundingRect;
+
+      return {
+        ok: true,
+        content: [
+          {
+            type: 'text',
+            text:
+              `Scrolled element ${targetRef || resolvedRef} ${direction}` +
+              (scrollResult.amount ? ` (${scrollResult.amount}px)` : ''),
+          },
+        ],
+        _meta: Object.keys(meta).length ? meta : undefined,
+        data: {
+          url: tab.url,
+          direction,
+          amount: scrollResult.amount,
+          target: targetRef || resolvedRef,
+          timestamp: new Date().toISOString(),
+          tabId,
+          targetScrollTop: elementMeta?.scrollTop ?? null,
+        },
+      };
+    }
 
     return {
       ok: true,
       content: [
         {
           type: 'text',
-          text: `Scrolled ${direction} (${amount}px)`,
+          text: `Scrolled ${direction}` + (scrollResult.amount ? ` (${scrollResult.amount}px)` : ''),
         },
       ],
       _meta: Object.keys(meta).length ? meta : undefined,
       data: {
         url: tab.url,
         direction,
-        amount,
+        amount: scrollResult.amount,
         timestamp: new Date().toISOString(),
         tabId,
       },

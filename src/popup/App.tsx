@@ -1,13 +1,21 @@
-import { Settings } from 'lucide-react';
+import { Globe, Loader2, Plug, PlugZap, Server, Settings } from 'lucide-react';
 
-import { BridgeStatusCard } from './components/BridgeStatusCard';
 import { SettingsOverlay } from './components/SettingsOverlay';
+import { ProfileStatusCard } from './components/ProfileStatusCard';
 import { TabStatusCard } from './components/TabStatusCard';
 import { Button } from './components/ui/button';
 import { useExtensionState } from './hooks/useExtensionState';
+import { cn } from './lib/utils';
 
 export default function App() {
-  const { bridge, tab, settings, actions } = useExtensionState();
+  const { bridge, web, tab, profile, settings, actions } = useExtensionState();
+  const BridgeIcon = bridge.tone === 'connected' ? PlugZap : Plug;
+  const bridgeHover =
+    bridge.tone === 'connected' ? 'MCP Server: Connected' : bridge.tone === 'connecting' ? 'MCP Server: Connecting…' : 'MCP Server: Not connected';
+
+  const webHover = web.connected
+    ? `Web: ${web.count} client${web.count !== 1 ? 's' : ''} connected`
+    : 'Web: No clients connected';
 
   const handleSettingsOpenChange = (open: boolean) => {
     if (open) {
@@ -26,30 +34,73 @@ export default function App() {
             Manage the MCP bridge connection and active browser tab.
           </p>
         </div>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          onClick={actions.openSettings}
-          aria-label="Open settings"
-        >
-          <Settings className="h-4 w-4" />
-        </Button>
+        <div className="flex items-center gap-2">
+          {/* Web status indicator (passive - no button) */}
+          <div
+            className={cn(
+              'flex h-9 w-9 items-center justify-center rounded-md border shadow-sm',
+              web.connected
+                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                : 'bg-neutral-50 text-neutral-400 border-neutral-200',
+            )}
+            title={webHover}
+            aria-label={webHover}
+          >
+            <Globe className="h-4 w-4" />
+          </div>
+          {/* MCP Server status button */}
+          <Button
+            type="button"
+            onClick={() => actions.toggleBridge(bridge.action)}
+            disabled={settings.saving}
+            className={cn(
+              'shadow-sm',
+              bridge.tone === 'connected'
+                ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200'
+                : bridge.tone === 'connecting'
+                  ? 'bg-neutral-100 text-neutral-700 hover:bg-neutral-200'
+                  : 'bg-red-100 text-red-700 hover:bg-red-200',
+            )}
+            title={bridgeHover}
+            aria-label={bridgeHover}
+            size="icon"
+          >
+            {bridge.showSpinner ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Server className="h-4 w-4" />
+            )}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            onClick={actions.openSettings}
+            aria-label="Open settings"
+            title="Configure bridge settings"
+          >
+            <Settings className="h-4 w-4" />
+          </Button>
+        </div>
       </header>
 
-      <div className="space-y-3">
-        <BridgeStatusCard
-          statusLabel={bridge.statusLabel}
-          detail={bridge.detail}
-          lastError={bridge.state.lastError}
-          actionLabel={bridge.actionLabel}
-          action={bridge.action}
-          showSpinner={bridge.showSpinner}
-          disabled={settings.saving}
-          onToggle={actions.toggleBridge}
-        />
-        <TabStatusCard statusLabel={tab.statusLabel} message={tab.message} actions={tab.actions} />
-      </div>
+      {profile.showSelector ? (
+        <div className="space-y-3">
+          <ProfileStatusCard
+            label={profile.label}
+            statusLabel={profile.statusLabel}
+            isActive={profile.isActive}
+            actionLabel={profile.actionLabel}
+            onActivate={profile.isActive ? undefined : actions.activateProfile}
+          />
+        </div>
+      ) : null}
+
+      {!profile.hideTabSection ? (
+        <div className="space-y-3">
+          <TabStatusCard statusLabel={tab.statusLabel} message={tab.message} actions={tab.actions} />
+        </div>
+      ) : null}
 
       <SettingsOverlay
         open={settings.open}
