@@ -1,0 +1,14 @@
+USB copy instructions (Windows) - beginner friendly
+
+On the online computer (where you downloaded the files):
+1) Plug in a USB drive (recommended: 32 GB or larger, USB 3.0).
+2) Open File Explorer and find the USB drive letter (for example E:).
+3) Right-click the 'offline-setup-windows-template' folder on your Desktop and choose "Send to" → [Your USB drive].
+4) Wait until the copy finishes (the progress bar disappears).
+5) Click the small USB icon in the system tray (bottom-right) and choose "Eject [USB name]".
+6) When Windows says it’s safe, remove the USB and bring it to the offline computer.
+
+On the offline computer (first steps):
+1) Insert the USB and copy the 'offline-setup-windows-template' folder to the Desktop.
+2) BEFORE running anything, turn off Wi‑Fi and unplug any Ethernet cables.
+3) Then open the 'installers' folder and run the LM Studio and Jan installers.

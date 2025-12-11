@@ -1,0 +1,174 @@
+OFFLINE AIR-GAP RAG SETUP — QUICK START GUIDE
+==============================================
+
+This guide sets up a 100% offline local RAG system (LM Studio + Jan + Qwen + local documents).
+
+---
+
+PART A: ONLINE MACHINE (5–10 minutes)
+=====================================
+
+WHAT YOU NEED:
+- USB drive (32GB+ recommended, fast USB 3.0 preferred)
+- Internet access (to download installers and models once)
+- Windows 11 PC
+
+WHAT TO DO:
+
+1. Download installers and models (save to your Desktop):
+   - LM Studio (https://lmstudio.ai) → download installer
+   - Jan (https://jan.ai) → download installer  
+   - Qwen-7B-Chat GGUF Q4_K_M (HuggingFace) → download model
+   - all-MiniLM-L6-v2.gguf (HuggingFace) → download model
+   - (Optional) convert_to_pdf.py (if you have Office files)
+
+2. Place files in the template folder on your Desktop:
+   - Create folder: C:\Users\<You>\Desktop\offline-setup-windows-template
+   - Create subfolders: installers, models, docs-samples
+   - Copy LM Studio installer → installers\
+   - Copy Jan installer → installers\
+   - Copy both .gguf files → models\
+   - (Optional) Copy convert_to_pdf.py → root folder
+   - Copy 2–3 sample documents to → docs-samples\ (for testing)
+
+3. Open PowerShell as Administrator and run:
+
+   cd "C:\Users\<You>\Desktop\offline-setup-windows-template"
+   .\prepare_usb.ps1
+
+   Follow the prompts:
+   - Verify files are found
+   - Insert USB drive (32GB+)
+   - Confirm copy to USB
+   - Wait 5–30 minutes (depending on model sizes)
+   - When done, safely eject USB
+
+---
+
+PART B: OFFLINE MACHINE (30–60 minutes, fully air-gapped)
+=========================================================
+
+BEFORE YOU START:
+- This machine must NOT be connected to the internet during setup
+- Have the USB drive from Part A ready
+
+WHAT TO DO:
+
+1. Insert USB into offline machine
+
+2. DISCONNECT FROM NETWORK:
+   - Turn OFF Wi-Fi (click Wi-Fi icon in taskbar → Off)
+   - Unplug Ethernet cable (if present)
+   - VERIFY: check taskbar — should show "No internet" or similar
+
+3. Copy folder from USB to Desktop:
+   - Open File Explorer
+   - Navigate to USB drive
+   - Copy "offline-setup-windows-template" folder to Desktop
+   - (Do NOT run anything yet)
+
+4. Open PowerShell as Administrator:
+   - Press Win + X → Windows PowerShell (Admin)
+   - Type and run:
+   
+   cd "$env:USERPROFILE\Desktop\offline-setup-windows-template"
+   Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+   .\run_offline.ps1
+
+5. Wait for the script to complete:
+   - It will check that you're offline (will fail if internet detected)
+   - It will scan your documents
+   - It will attempt to copy models to LM Studio
+   - It will start LM Studio and Jan automatically
+   - A log file will open on your Desktop
+   
+   Review the log. It will tell you what happened and next steps.
+
+6. MANUAL STEPS (after script completes):
+
+   A) Import Models into LM Studio (GUI):
+      - LM Studio should now be running
+      - Click "Models" tab (left sidebar)
+      - Click "Import model" or "+"
+      - Navigate to: C:\Users\<You>\.lm-studio\models
+      - Select: Qwen-7B-Chat.gguf
+      - Click "Open" and wait for import
+      - Repeat for: all-MiniLM-L6-v2.gguf
+      - ✅ When done, you should see both models listed
+
+   B) Index Documents in Jan (GUI):
+      - Jan should now be running
+      - Look for a button: "Add documents", "Index", or "Folder"
+      - Click it
+      - Select your documents folder (e.g., C:\Users\<You>\Documents\MyDocs)
+      - When prompted for "search model", pick: all-MiniLM-L6-v2
+      - When prompted for "main LLM", pick: Qwen-7B-Chat
+      - Click "Start indexing" or similar
+      - Wait for progress to complete (depends on document count)
+      - ✅ When done, Jan will show "Indexing complete" or similar
+
+7. TEST YOUR SETUP:
+   - In Jan, type a question:
+     "What is in sample_document.pdf? Show the source."
+   - ✅ SUCCESS if Jan replies with content from the PDF and mentions the filename as the source
+   - ❌ FAIL if Jan doesn't reference the document filename or gives no relevant answer
+
+---
+
+TROUBLESHOOTING
+===============
+
+❌ "Internet detected!" error
+   → Check Wi-Fi and Ethernet again
+   → Unplug all network cables
+   → Disable Wi-Fi in BIOS if available
+   → Try again
+
+❌ Models not found in LM Studio
+   → LM Studio might not have created its model folder yet
+   → Start LM Studio manually once to create the folder
+   → Then copy model files manually:
+      From: D:\offline-setup-windows-template\models\*.gguf
+      To:   C:\Users\<You>\.lm-studio\models\
+
+❌ Jan doesn't show indexing button
+   → Check Jan version (should be latest)
+   → Look for menu: Settings → Advanced → Local index
+   → Enable if available
+
+❌ Indexed documents not returned in answers
+   → Wait 5 minutes (indexing may still be processing)
+   → Try asking a very specific question: "List all files you indexed."
+   → Check if all documents were successfully copied to the documents folder
+
+---
+
+SECURITY & OFFLINE OPERATION
+=============================
+
+✅ No cloud services
+✅ No telemetry
+✅ No updates (all offline)
+✅ Network disconnect verified before setup
+✅ All models run locally
+✅ Documents never leave your machine
+
+---
+
+QUESTIONS OR ISSUES?
+====================
+
+Check the log file:
+  C:\Users\<You>\Desktop\offline-setup.log
+
+Or check the validator JSON:
+  C:\Users\<You>\Desktop\offline-validator-scan.json
+
+Both contain detailed information about what was detected and attempted.
+
+---
+
+DONE! 🎉
+
+Your offline RAG system is now ready.
+Keep the USB as a backup (do not reuse it on online machines).
