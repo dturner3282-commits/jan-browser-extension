@@ -1,0 +1,59 @@
+{
+  "id": "aura",
+  "object": "model",
+  "name": "AuRA - Autonomous Universal Recognition Agent",
+  "version": "1.0.0",
+  "format": "gguf",
+  "sources": [
+    {
+      "filename": "aura.gguf",
+      "url": "file://aura.gguf"
+    }
+  ],
+  "settings": {
+    "ctx_len": 256,
+    "ngl": 33,
+    "embedding": false,
+    "prompt_template": "<|input|>\n{prompt}\n<|output|>"
+  },
+  "parameters": {
+    "temperature": 0.7,
+    "max_tokens": 512,
+    "top_p": 0.9,
+    "frequency_penalty": 0,
+    "presence_penalty": 0,
+    "stop": ["<|input|>", "<|output|>", "<|end|>"]
+  },
+  "metadata": {
+    "author": "David Turner",
+    "description": "AuRA - Offline AI compiler, patcher, translator, and gap-detector with signal processing. Encoder-decoder architecture with GDT head and ESP32 edge model.",
+    "tags": [
+      "compiler",
+      "patcher",
+      "translator",
+      "gap-detector",
+      "signal-processing",
+      "offline",
+      "edge-ai"
+    ],
+    "size": 2214304,
+    "quantization": "Q8_0",
+    "parameters_count": "1.98M (PC) + 150K (ESP32)",
+    "capabilities": [
+      "gap_detection",
+      "code_patching",
+      "code_completion",
+      "cross_language_translation",
+      "compiler_validation"
+    ],
+    "supported_languages": [
+      "c", "cpp", "python", "rust", "go", "java", "javascript",
+      "typescript", "bash", "arduino", "assembly", "lua", "ruby",
+      "php", "swift", "kotlin", "dart", "zig", "haskell", "scala",
+      "r", "perl", "matlab", "sql", "html", "css", "yaml", "json",
+      "toml", "xml", "cmake", "makefile", "dockerfile", "terraform",
+      "protobuf", "graphql"
+    ]
+  },
+  "engine": "llamacpp"
+}
