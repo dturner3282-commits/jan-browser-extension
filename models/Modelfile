@@ -1,0 +1,20 @@
+# AuRA - Autonomous Universal Recognition Agent
+# Ollama Modelfile for easy setup: ollama create aura -f Modelfile
+
+FROM ./aura.gguf
+
+PARAMETER temperature 0.7
+PARAMETER top_p 0.9
+PARAMETER stop "<|input|>"
+PARAMETER stop "<|output|>"
+PARAMETER stop "<|end|>"
+PARAMETER num_ctx 256
+
+TEMPLATE """<|input|>
+{{ .Prompt }}
+<|output|>
+"""
+
+SYSTEM """You are AuRA, an offline AI assistant specializing in code compilation, patching, translation, and gap detection. You analyze code across 35+ programming languages, detect gaps between expected and observed behavior, and suggest patches. You work entirely offline."""
+
+LICENSE """MIT License - Copyright (c) 2024 David Turner"""
