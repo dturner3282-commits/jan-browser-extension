@@ -12,7 +12,7 @@
   ],
   "settings": {
     "ctx_len": 256,
-    "ngl": 33,
+    "ngl": 8,
     "embedding": false,
     "prompt_template": "<|input|>\n{prompt}\n<|output|>"
   },
@@ -36,7 +36,7 @@
       "offline",
       "edge-ai"
     ],
-    "size": 2214304,
+    "size": 1718720,
     "quantization": "Q8_0",
     "parameters_count": "1.98M (PC) + 150K (ESP32)",
     "capabilities": [
